@@ -107,7 +107,7 @@ def pad_array(array, sr):
 
 
 # =====================================
-# EDGE TTS
+# EDGE TTS - FIXED VERSION
 # =====================================
 
 
@@ -152,51 +152,193 @@ def edge_tts_voices_list():
     return formatted_voices
 
 
+async def edge_tts_with_retry(text, voice_name, output_file, max_retries=5):
+    """
+    محاولة Edge TTS مع retry mechanism محسّن
+    """
+    for attempt in range(max_retries):
+        try:
+            # إضافة delay تدريجي لتجنب rate limiting
+            if attempt > 0:
+                wait_time = min(2 ** attempt, 10)  # exponential backoff
+                logger.info(f"Retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                await asyncio.sleep(wait_time)
+            
+            # محاولة الاتصال
+            communicate = edge_tts.Communicate(text, voice_name)
+            await communicate.save(output_file)
+            
+            # التحقق من الملف
+            if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+                return True
+            else:
+                raise TTS_OperationError("File not created or empty")
+                
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout on attempt {attempt + 1}")
+            if attempt == max_retries - 1:
+                return False
+        except Exception as e:
+            error_msg = str(e)
+            logger.warning(f"Attempt {attempt + 1} failed: {error_msg}")
+            
+            # إذا كان الخطأ 403 أو WebSocket error، نزيد وقت الانتظار
+            if "403" in error_msg or "WSServerHandshakeError" in error_msg:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(min(5 * (attempt + 1), 15))
+            
+            if attempt == max_retries - 1:
+                return False
+    
+    return False
+
+
+def fallback_to_gtts(text, lang_code, output_file):
+    """
+    استخدام gTTS كبديل عند فشل Edge TTS
+    """
+    try:
+        from tempfile import TemporaryFile
+        
+        logger.info(f"Using gTTS fallback for: {text[:50]}...")
+        
+        # إنشاء TTS باستخدام gTTS
+        tts = gTTS(text=text, lang=lang_code, slow=False)
+        
+        # حفظ في ملف مؤقت
+        f = TemporaryFile()
+        tts.write_to_fp(f)
+        f.seek(0)
+        
+        # قراءة البيانات الصوتية
+        audio_data, samplerate = sf.read(f)
+        f.close()
+        
+        # حفظ كـ OGG
+        write_chunked(
+            output_file, audio_data, samplerate, format="ogg", subtype="vorbis"
+        )
+        
+        verify_saved_file_and_size(output_file)
+        return True
+        
+    except Exception as e:
+        logger.error(f"gTTS fallback also failed: {str(e)}")
+        return False
+
+
 def segments_egde_tts(filtered_edge_segments, TRANSLATE_AUDIO_TO, is_gui):
-    for segment in tqdm(filtered_edge_segments["segments"]):
+    """
+    نسخة محسّنة من segments_egde_tts مع حل مشكلة 403
+    """
+    total_segments = len(filtered_edge_segments["segments"])
+    failed_segments = []
+    success_count = 0
+    
+    for idx, segment in enumerate(tqdm(filtered_edge_segments["segments"], desc="Edge TTS Processing")):
         speaker = segment["speaker"] # noqa
         text = segment["text"]
         start = segment["start"]
         tts_name = segment["tts_name"]
 
-        # make the tts audio
+        # إنشاء أسماء الملفات
         filename = f"audio/{start}.ogg"
         temp_file = filename[:-3] + "mp3"
 
-        logger.info(f"{text} >> {filename}")
+        logger.info(f"[{idx+1}/{total_segments}] {text[:50]}... >> {filename}")
+        
+        edge_success = False
+        
         try:
+            # المحاولة الأولى: Edge TTS مع retry
             if is_gui:
-                asyncio.run(
-                    edge_tts.Communicate(
-                        text, "-".join(tts_name.split("-")[:-1])
-                    ).save(temp_file)
+                voice_name = "-".join(tts_name.split("-")[:-1])
+                edge_success = asyncio.run(
+                    edge_tts_with_retry(text, voice_name, temp_file, max_retries=5)
                 )
             else:
-                # nest_asyncio.apply() if not is_gui else None
-                command = f'edge-tts -t "{text}" -v "{tts_name.replace("-Male", "").replace("-Female", "")}" --write-media "{temp_file}"'
-                run_command(command)
-            verify_saved_file_and_size(temp_file)
-
-            data, sample_rate = sf.read(temp_file)
-            data = pad_array(data, sample_rate)
-            # os.remove(temp_file)
-
-            # Save file
-            write_chunked(
-                file=filename,
-                samplerate=sample_rate,
-                data=data,
-                format="ogg",
-                subtype="vorbis",
-            )
-            verify_saved_file_and_size(filename)
+                # استخدام command line مع retry
+                for retry in range(3):
+                    try:
+                        command = f'edge-tts -t "{text}" -v "{tts_name.replace("-Male", "").replace("-Female", "")}" --write-media "{temp_file}"'
+                        run_command(command)
+                        if os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
+                            edge_success = True
+                            break
+                    except:
+                        if retry < 2:
+                            import time
+                            time.sleep(2 * (retry + 1))
+            
+            # إذا نجح Edge TTS
+            if edge_success:
+                verify_saved_file_and_size(temp_file)
+                
+                # قراءة ومعالجة الملف
+                data, sample_rate = sf.read(temp_file)
+                data = pad_array(data, sample_rate)
+                
+                # حفظ الملف النهائي
+                write_chunked(
+                    file=filename,
+                    samplerate=sample_rate,
+                    data=data,
+                    format="ogg",
+                    subtype="vorbis",
+                )
+                verify_saved_file_and_size(filename)
+                success_count += 1
+                
+                # حذف الملف المؤقت
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
+                    
+            else:
+                # إذا فشل Edge TTS، استخدم gTTS
+                raise TTS_OperationError("Edge TTS failed after retries")
 
         except Exception as error:
-            error_handling_in_tts(error, segment, TRANSLATE_AUDIO_TO, filename)
+            logger.warning(f"Edge TTS failed, switching to gTTS: {str(error)}")
+            
+            # المحاولة الثانية: gTTS fallback
+            lang_code = fix_code_language(TRANSLATE_AUDIO_TO)
+            gtts_success = fallback_to_gtts(text, lang_code, filename)
+            
+            if gtts_success:
+                logger.info(f"✓ gTTS fallback successful for segment {idx+1}")
+                success_count += 1
+            else:
+                # المحاولة الأخيرة: silent audio
+                logger.error(f"All TTS methods failed, creating silent audio")
+                try:
+                    sample_rate_aux = 22050
+                    duration = float(segment["end"]) - float(segment["start"])
+                    data = np.zeros(int(sample_rate_aux * duration)).astype(np.float32)
+                    write_chunked(
+                        filename, data, sample_rate_aux, format="ogg", subtype="vorbis"
+                    )
+                    verify_saved_file_and_size(filename)
+                    failed_segments.append(idx + 1)
+                except Exception as e:
+                    logger.critical(f"Even silent audio creation failed: {str(e)}")
+                    failed_segments.append(idx + 1)
+    
+    # تقرير نهائي
+    logger.info(f"\n{'='*50}")
+    logger.info(f"TTS Processing Complete:")
+    logger.info(f"  Total segments: {total_segments}")
+    logger.info(f"  Successful: {success_count}")
+    logger.info(f"  Failed (silent): {len(failed_segments)}")
+    if failed_segments:
+        logger.warning(f"  Failed segment numbers: {failed_segments}")
+    logger.info(f"{'='*50}\n")
 
 
 # =====================================
-# BARK TTS
+# باقي الكود كما هو (BARK TTS, VITS, etc.)
+# =====================================
 # =====================================
 
 
