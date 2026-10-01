@@ -27,6 +27,7 @@ TRANSLATION_PROCESS_OPTIONS = [
     "gpt-4-turbo-preview",
     *GEMINI_PROCESS_OPTIONS,
     *GEMINI_TASHKEEL_PROCESS_OPTIONS,
+    "nllb_egyptian_en_to_arz",
     "disable_translation",
 ]
 DOCS_TRANSLATION_PROCESS_OPTIONS = [
@@ -807,6 +808,74 @@ def gemini_batch(
     return segments_copy
 
 
+# =====================================
+# NLLB Egyptian Arabic (English -> Egyptian Arabic)
+# Model: IbrahimAmin/nllb-200-distilled-600M-en-to-arz
+# =====================================
+NLLB_EGYPTIAN_MODEL = "IbrahimAmin/nllb-200-distilled-600M-en-to-arz"
+_NLLB_CACHE = {}
+
+
+def _load_nllb_egyptian():
+    """Load the model once and keep it in memory (lazy loading)."""
+    if "model" not in _NLLB_CACHE:
+        import torch
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+        device = os.environ.get("SONITR_DEVICE") or (
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        logger.info(f"Loading Egyptian translation model: {NLLB_EGYPTIAN_MODEL}")
+        tokenizer = AutoTokenizer.from_pretrained(
+            NLLB_EGYPTIAN_MODEL, src_lang="eng_Latn"
+        )
+        model = AutoModelForSeq2SeqLM.from_pretrained(NLLB_EGYPTIAN_MODEL)
+        model = model.to(device).eval()
+        _NLLB_CACHE.update(model=model, tokenizer=tokenizer, device=device)
+    return _NLLB_CACHE["model"], _NLLB_CACHE["tokenizer"], _NLLB_CACHE["device"]
+
+
+def nllb_egyptian_translate(segments, batch_size=16):
+    """Translate English segments to Egyptian Arabic (arz_Arab)."""
+    import torch
+
+    segments_ = copy.deepcopy(segments)
+    model, tokenizer, device = _load_nllb_egyptian()
+    bos_id = tokenizer.convert_tokens_to_ids("arz_Arab")
+
+    texts = [seg["text"].strip() for seg in segments_]
+    results = []
+    for i in tqdm(range(0, len(texts), batch_size)):
+        batch = texts[i:i + batch_size]
+        inputs = tokenizer(
+            batch, return_tensors="pt", padding=True,
+            truncation=True, max_length=256,
+        ).to(device)
+        with torch.no_grad():
+            out = model.generate(
+                **inputs,
+                forced_bos_token_id=bos_id,
+                max_length=256,
+                num_beams=4,
+            )
+        results.extend(tokenizer.batch_decode(out, skip_special_tokens=True))
+
+    for seg, original, translated in zip(segments_, texts, results):
+        logger.debug(f"{original} >> {translated}")
+        seg["text"] = translated.strip()
+
+    # free GPU memory for the next steps (TTS)
+    try:
+        import gc
+        import torch
+        _NLLB_CACHE.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    return segments_
+
+
 def translate_text(
     segments,
     target,
@@ -857,6 +926,16 @@ def translate_text(
                 source,
                 tashkeel=True
             )
+        case "nllb_egyptian_en_to_arz":
+            src = fix_code_language(source) if source else "en"
+            tgt = fix_code_language(target)
+            if src != "en" or not str(tgt).startswith("ar"):
+                logger.error(
+                    "nllb_egyptian_en_to_arz only supports English -> Arabic. "
+                    "Falling back to Google Translate."
+                )
+                return translate_batch(segments, tgt, chunk_size, src)
+            return nllb_egyptian_translate(segments)
         case "disable_translation":
             return segments
         case _:
