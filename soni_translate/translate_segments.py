@@ -7,7 +7,12 @@ from .logging_setup import logger
 import re
 import json
 import time
+import os
 
+GEMINI_PROCESS_OPTIONS = [
+    "gemini-3.8-flash_batch",
+    "gemini-3.5-flash-lite_batch",
+]
 TRANSLATION_PROCESS_OPTIONS = [
     "google_translator_batch",
     "google_translator",
@@ -15,14 +20,24 @@ TRANSLATION_PROCESS_OPTIONS = [
     "gpt-3.5-turbo-0125",
     "gpt-4-turbo-preview_batch",
     "gpt-4-turbo-preview",
+    *GEMINI_PROCESS_OPTIONS,
     "disable_translation",
 ]
 DOCS_TRANSLATION_PROCESS_OPTIONS = [
     "google_translator",
     "gpt-3.5-turbo-0125",
     "gpt-4-turbo-preview",
+    *GEMINI_PROCESS_OPTIONS,
     "disable_translation",
 ]
+
+# Gemini API (Google AI Studio)
+GEMINI_API_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "{model}:generateContent"
+)
+# Models tried in this order if one is not available for the API key
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
 
 
 def translate_iterative(segments, target, source=None):
@@ -418,6 +433,328 @@ def gpt_batch(segments, model, target, token_batch_limit=900, source=None):
     )
 
 
+class GeminiFatalError(Exception):
+    """Error that retrying or falling back cannot fix (bad key, etc.)."""
+
+
+class GeminiModelNotFound(Exception):
+    """The model name does not exist or is not available for this key."""
+
+
+class GeminiQuotaError(Exception):
+    """Rate limit / server errors that persisted after all retries."""
+
+
+def get_gemini_api_key():
+    return (
+        os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+        or ""
+    ).strip()
+
+
+def _gemini_error_message(response):
+    try:
+        return response.json()["error"]["message"]
+    except Exception:
+        return response.text[:300]
+
+
+def call_gemini_api(
+    model, api_key, system_prompt, user_prompt, max_retries=6, timeout=180
+):
+    """
+    Send one request to the Gemini API and return the text of the answer.
+    Retries on rate limit (429) and temporary server errors (5xx).
+    """
+    import requests
+
+    url = GEMINI_API_URL.format(model=model)
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+    }
+    body = {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }
+
+    for attempt in range(max_retries):
+        wait = min(60, 2 ** (attempt + 1))
+        try:
+            response = requests.post(
+                url, headers=headers, json=body, timeout=timeout
+            )
+        except (requests.ConnectionError, requests.Timeout) as error:
+            logger.warning(f"Gemini connection problem: {error}")
+            if attempt == max_retries - 1:
+                raise GeminiQuotaError(str(error))
+            time.sleep(wait)
+            continue
+
+        status = response.status_code
+
+        if status == 200:
+            try:
+                data = response.json()
+            except Exception:
+                raise ValueError("Gemini returned a non-JSON response")
+            candidates = data.get("candidates") or []
+            if not candidates:
+                reason = (data.get("promptFeedback") or {}).get(
+                    "blockReason", "no candidates"
+                )
+                raise ValueError(f"Gemini returned no answer ({reason})")
+            parts = (candidates[0].get("content") or {}).get("parts") or []
+            text = "".join(
+                part.get("text", "")
+                for part in parts
+                if isinstance(part, dict) and not part.get("thought")
+            )
+            if not text.strip():
+                finish = candidates[0].get("finishReason", "unknown")
+                raise ValueError(f"Gemini returned empty text ({finish})")
+            return text
+
+        message = _gemini_error_message(response)
+
+        if status in (429, 500, 502, 503, 504):
+            logger.warning(
+                f"Gemini error {status}: {message}. "
+                f"Retry {attempt + 1}/{max_retries} in {wait}s"
+            )
+            if attempt == max_retries - 1:
+                raise GeminiQuotaError(f"{status}: {message}")
+            retry_after = response.headers.get("Retry-After", "")
+            if retry_after.isdigit():
+                wait = min(120, max(wait, int(retry_after)))
+            time.sleep(wait)
+            continue
+
+        if status == 404:
+            raise GeminiModelNotFound(f"{model}: {message}")
+
+        # 400 (invalid key / bad request), 401, 403 and others
+        raise GeminiFatalError(f"Gemini API error {status}: {message}")
+
+    raise GeminiQuotaError("Gemini request failed after retries")
+
+
+def parse_gemini_items(raw_text, expected_ids):
+    """
+    Convert the JSON answer into {id: translated_text}.
+    Raises ValueError if any expected id is missing.
+    """
+    text = raw_text.strip()
+    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.DOTALL)
+    if fence:
+        text = fence.group(1)
+
+    try:
+        data = json.loads(text)
+    except Exception:
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if not match:
+            raise ValueError("The answer is not valid JSON")
+        data = json.loads(match.group(0))
+
+    if isinstance(data, dict):
+        lists = [v for v in data.values() if isinstance(v, list)]
+        if not lists:
+            raise ValueError("No list found in the JSON answer")
+        data = lists[0]
+    if not isinstance(data, list):
+        raise ValueError("The JSON answer is not a list")
+
+    result = {}
+    for item in data:
+        if not isinstance(item, dict) or "id" not in item:
+            continue
+        try:
+            item_id = int(item["id"])
+        except (TypeError, ValueError):
+            continue
+        translated = item.get("text")
+        if isinstance(translated, str):
+            result[item_id] = translated
+
+    missing = [i for i in expected_ids if i not in result]
+    if missing:
+        raise ValueError(
+            f"Incomplete answer, missing ids: {missing[:10]} "
+            f"(received {len(result)}, expected {len(expected_ids)})"
+        )
+    return {i: result[i] for i in expected_ids}
+
+
+class GeminiTranslator:
+    def __init__(self, model, target, source=None):
+        self.api_key = get_gemini_api_key()
+        if not self.api_key:
+            raise ValueError(
+                "GEMINI_API_KEY is not set. Set it as an environment "
+                "variable or change the translation process."
+            )
+        self.models = [model] + [m for m in GEMINI_MODELS if m != model]
+        self.model_index = 0
+
+        self.lang_tg = re.sub(
+            r"\([^)]*\)", "", INVERTED_LANGUAGES.get(target, target)
+        ).strip()
+        self.lang_sc = ""
+        if source:
+            self.lang_sc = re.sub(
+                r"\([^)]*\)", "", INVERTED_LANGUAGES.get(source, source)
+            ).strip()
+
+        self.fixed_target = fix_code_language(target)
+        self.fixed_source = fix_code_language(source) if source else "auto"
+        self.google = None
+
+        from_text = f" from {self.lang_sc}" if self.lang_sc else ""
+        self.system_prompt = (
+            "You are a professional translator for video dubbing. "
+            f"Translate every text{from_text} into {self.lang_tg}. "
+            "The input is a JSON array of objects with the keys \"id\" and "
+            "\"text\". Return ONLY a JSON array with exactly one object per "
+            "input object, using the same \"id\" and the translated text in "
+            "the key \"text\". Never merge, split, skip or reorder items. "
+            "Keep names, numbers and technical terms correct. Use natural, "
+            "spoken language that is easy to read aloud. Do not add "
+            "comments or explanations."
+        )
+
+    def _request(self, items):
+        payload = [{"id": idx, "text": text} for idx, text in items]
+        user_prompt = json.dumps(payload, ensure_ascii=False)
+        expected_ids = [idx for idx, _ in items]
+
+        while True:
+            model = self.models[self.model_index]
+            try:
+                raw = call_gemini_api(
+                    model, self.api_key, self.system_prompt, user_prompt
+                )
+                logger.debug(f"Gemini ({model}) answer: {raw}")
+                return parse_gemini_items(raw, expected_ids)
+            except GeminiModelNotFound as error:
+                logger.warning(f"Model not available: {error}")
+                if self.model_index + 1 >= len(self.models):
+                    raise GeminiFatalError(
+                        "None of the Gemini models are available for this "
+                        f"API key: {', '.join(self.models)}. Check the "
+                        "model names in Google AI Studio."
+                    )
+                self.model_index += 1
+                logger.warning(
+                    f"Switching to model {self.models[self.model_index]}"
+                )
+
+    def _google_fallback(self, items):
+        from deep_translator import GoogleTranslator
+
+        if self.google is None:
+            self.google = GoogleTranslator(
+                source=self.fixed_source, target=self.fixed_target
+            )
+        result = {}
+        for idx, text in items:
+            try:
+                result[idx] = self.google.translate(text.strip())
+            except Exception as error:
+                logger.error(
+                    f"Google Translate fallback failed, keeping the "
+                    f"original text: {error}"
+                )
+                result[idx] = text
+        return result
+
+    def translate_items(self, items):
+        """items: list of (index, text). Returns {index: translation}."""
+        last_error = None
+        for _ in range(2):
+            try:
+                return self._request(items)
+            except GeminiFatalError:
+                raise
+            except GeminiQuotaError as error:
+                logger.error(str(error))
+                logger.warning(
+                    f"{len(items)} segments are being translated with "
+                    "Google Translate because Gemini is not responding"
+                )
+                return self._google_fallback(items)
+            except Exception as error:
+                last_error = error
+                logger.error(f"Gemini batch problem: {error}")
+
+        if len(items) > 1:
+            logger.warning(
+                f"Splitting a batch of {len(items)} segments in two"
+            )
+            mid = len(items) // 2
+            result = self.translate_items(items[:mid])
+            result.update(self.translate_items(items[mid:]))
+            return result
+
+        logger.warning(
+            f"Segment {items[0][0]} is being corrected with Google "
+            f"Translate ({last_error})"
+        )
+        return self._google_fallback(items)
+
+
+def gemini_batch(
+    segments, model, target, source=None, batch_size=40, max_chars=6000
+):
+    """
+    Translate segments with the Gemini API in batches.
+    Only the 'text' key changes; start, end, speaker, etc. are untouched.
+    """
+    segments_copy = copy.deepcopy(segments)
+    translator = GeminiTranslator(model, target, source)
+
+    pending = []
+    for idx, segment in enumerate(segments_copy):
+        text = str(segment.get("text", "")).strip()
+        if text:
+            pending.append((idx, text))
+
+    batches = []
+    current, current_chars = [], 0
+    for idx, text in pending:
+        if current and (
+            len(current) >= batch_size
+            or current_chars + len(text) > max_chars
+        ):
+            batches.append(current)
+            current, current_chars = [], 0
+        current.append((idx, text))
+        current_chars += len(text)
+    if current:
+        batches.append(current)
+
+    progress_bar = tqdm(total=len(pending), desc="Translating")
+    for number, batch in enumerate(batches):
+        if number:
+            time.sleep(1)
+        translated = translator.translate_items(batch)
+        for idx, original in batch:
+            new_text = (
+                str(translated.get(idx, original))
+                .replace("\t", " ")
+                .replace("\n", " ")
+                .strip()
+            )
+            logger.debug(f"{original} >> {new_text}")
+            segments_copy[idx]["text"] = new_text if new_text else original
+        progress_bar.update(len(batch))
+    progress_bar.close()
+
+    return segments_copy
+
+
 def translate_text(
     segments,
     target,
@@ -449,6 +786,13 @@ def translate_text(
                 translation_process.replace("_batch", ""),
                 target,
                 token_batch_limit,
+                source
+            )
+        case model if model in GEMINI_PROCESS_OPTIONS:
+            return gemini_batch(
+                segments,
+                translation_process.replace("_batch", ""),
+                target,
                 source
             )
         case "disable_translation":
