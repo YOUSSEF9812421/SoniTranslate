@@ -942,6 +942,164 @@ def segments_openai_tts(
 
 
 # =====================================
+# GEMINI TTS (Google AI Studio)
+# =====================================
+
+GEMINI_TTS_MODEL = "gemini-3.8-flash-lite-tts"
+GEMINI_TTS_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "{model}:generateContent"
+)
+
+
+class GeminiTTSFatalError(Exception):
+    """Errors that cannot be fixed by retrying (bad key, wrong model)."""
+
+
+def _gemini_tts_api_key():
+    return (
+        os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+        or ""
+    ).strip()
+
+
+def request_gemini_tts(text, voice, api_key, max_retries=6, timeout=180):
+    """
+    Ask Gemini TTS for the audio of `text`.
+    Returns (float32 mono numpy array, sample rate).
+    Retries on 429 and temporary server errors.
+    """
+    import requests
+    import base64
+    import io
+    import time
+
+    url = GEMINI_TTS_URL.format(model=GEMINI_TTS_MODEL)
+    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": text}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {"voiceConfig": {"voice": voice}},
+        },
+    }
+
+    for attempt in range(max_retries):
+        wait = min(60, 2 ** (attempt + 1))
+        try:
+            response = requests.post(
+                url, headers=headers, json=body, timeout=timeout
+            )
+        except (requests.ConnectionError, requests.Timeout) as error:
+            logger.warning(f"Gemini TTS connection problem: {error}")
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(wait)
+            continue
+
+        status = response.status_code
+        if status == 200:
+            data = response.json()
+            candidates = data.get("candidates") or []
+            parts = (
+                (candidates[0].get("content") or {}).get("parts") or []
+                if candidates else []
+            )
+            inline = next(
+                (
+                    p.get("inlineData") or p.get("inline_data")
+                    for p in parts
+                    if isinstance(p, dict)
+                    and (p.get("inlineData") or p.get("inline_data"))
+                ),
+                None,
+            )
+            if not inline or not inline.get("data"):
+                reason = (data.get("promptFeedback") or {}).get(
+                    "blockReason", "no audio in the answer"
+                )
+                raise ValueError(f"Gemini TTS returned no audio ({reason})")
+
+            audio_bytes = base64.b64decode(inline["data"])
+            mime = str(
+                inline.get("mimeType") or inline.get("mime_type") or ""
+            ).lower()
+            if "l16" in mime or "pcm" in mime:
+                rate_match = re.search(r"rate=(\d+)", mime)
+                sample_rate = int(rate_match.group(1)) if rate_match else 24000
+                audio = np.frombuffer(audio_bytes, dtype="<i2")
+                audio = audio.astype(np.float32) / 32768.0
+            else:
+                audio, sample_rate = sf.read(
+                    io.BytesIO(audio_bytes), dtype="float32"
+                )
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+            return audio, sample_rate
+
+        try:
+            message = response.json()["error"]["message"]
+        except Exception:
+            message = response.text[:300]
+
+        if status in (429, 500, 502, 503, 504):
+            logger.warning(
+                f"Gemini TTS error {status}: {message}. "
+                f"Retry {attempt + 1}/{max_retries} in {wait}s"
+            )
+            if attempt == max_retries - 1:
+                raise TTS_OperationError(f"Gemini TTS {status}: {message}")
+            retry_after = response.headers.get("Retry-After", "")
+            if retry_after.isdigit():
+                wait = min(120, max(wait, int(retry_after)))
+            time.sleep(wait)
+            continue
+
+        raise GeminiTTSFatalError(f"Gemini TTS error {status}: {message}")
+
+    raise TTS_OperationError("Gemini TTS failed after retries")
+
+
+def segments_gemini_tts(filtered_gemini_tts_segments, TRANSLATE_AUDIO_TO):
+    api_key = _gemini_tts_api_key()
+    if not api_key:
+        raise GeminiTTSFatalError(
+            "GEMINI_API_KEY is not set. It is required for the Gemini TTS "
+            "voices (the ones ending with JOE)."
+        )
+
+    for segment in tqdm(filtered_gemini_tts_segments["segments"]):
+        text = segment["text"].strip()
+        start = segment["start"]
+        tts_name = segment["tts_name"]
+
+        # make the tts audio
+        filename = f"audio/{start}.ogg"
+        logger.info(f"{text} >> {filename}")
+
+        try:
+            voice = tts_name[1:].split()[0]
+            audio, sample_rate = request_gemini_tts(text, voice, api_key)
+
+            # Save file
+            data_tts = pad_array(audio, sample_rate)
+            write_chunked(
+                file=filename,
+                samplerate=sample_rate,
+                data=data_tts,
+                format="ogg",
+                subtype="vorbis",
+            )
+            verify_saved_file_and_size(filename)
+
+        except GeminiTTSFatalError:
+            raise
+        except Exception as error:
+            error_handling_in_tts(error, segment, TRANSLATE_AUDIO_TO, filename)
+
+
+# =====================================
 # Select task TTS
 # =====================================
 
@@ -1024,6 +1182,7 @@ def audio_segmentation_to_voice(
     pattern_coqui = re.compile(r".+\.(wav|mp3|ogg|m4a)$")
     pattern_vits_onnx = re.compile(r".* VITS-onnx$")
     pattern_openai_tts = re.compile(r".* OpenAI-TTS$")
+    pattern_gemini_tts = re.compile(r".* JOE$")
 
     all_segments = result_diarize["segments"]
 
@@ -1037,6 +1196,9 @@ def audio_segmentation_to_voice(
     speakers_openai_tts = find_spkr(
         pattern_openai_tts, speaker_to_voice, all_segments
     )
+    speakers_gemini_tts = find_spkr(
+        pattern_gemini_tts, speaker_to_voice, all_segments
+    )
 
     # Filter method in segments
     filtered_edge = filter_by_speaker(speakers_edge, all_segments)
@@ -1045,6 +1207,7 @@ def audio_segmentation_to_voice(
     filtered_coqui = filter_by_speaker(speakers_coqui, all_segments)
     filtered_vits_onnx = filter_by_speaker(speakers_vits_onnx, all_segments)
     filtered_openai_tts = filter_by_speaker(speakers_openai_tts, all_segments)
+    filtered_gemini_tts = filter_by_speaker(speakers_gemini_tts, all_segments)
 
     # Infer
     if filtered_edge["segments"]:
@@ -1074,6 +1237,9 @@ def audio_segmentation_to_voice(
     if filtered_openai_tts["segments"]:
         logger.info(f"OpenAI TTS: {speakers_openai_tts}")
         segments_openai_tts(filtered_openai_tts, TRANSLATE_AUDIO_TO)  # wav
+    if filtered_gemini_tts["segments"]:
+        logger.info(f"Gemini TTS: {speakers_gemini_tts}")
+        segments_gemini_tts(filtered_gemini_tts, TRANSLATE_AUDIO_TO)  # ogg
 
     [result.pop("tts_name", None) for result in result_diarize["segments"]]
     return [
@@ -1082,7 +1248,8 @@ def audio_segmentation_to_voice(
         speakers_vits,
         speakers_coqui,
         speakers_vits_onnx,
-        speakers_openai_tts
+        speakers_openai_tts,
+        speakers_gemini_tts
     ]
 
 
@@ -1101,7 +1268,8 @@ def accelerate_segments(
         speakers_vits,
         speakers_coqui,
         speakers_vits_onnx,
-        speakers_openai_tts
+        speakers_openai_tts,
+        *speakers_other_tts  # Gemini TTS (older cached results may lack it)
     ) = valid_speakers
 
     create_directories(f"{folder_output}/audio/")
