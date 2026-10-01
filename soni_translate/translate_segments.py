@@ -13,6 +13,11 @@ GEMINI_PROCESS_OPTIONS = [
     "gemini-3.8-flash_batch",
     "gemini-3.5-flash-lite_batch",
 ]
+# Arabic translation with full tashkeel (diacritics) on every word
+GEMINI_TASHKEEL_PROCESS_OPTIONS = [
+    "gemini-3.8-flash_tashkeel_batch",
+    "gemini-3.5-flash-lite_tashkeel_batch",
+]
 TRANSLATION_PROCESS_OPTIONS = [
     "google_translator_batch",
     "google_translator",
@@ -21,6 +26,7 @@ TRANSLATION_PROCESS_OPTIONS = [
     "gpt-4-turbo-preview_batch",
     "gpt-4-turbo-preview",
     *GEMINI_PROCESS_OPTIONS,
+    *GEMINI_TASHKEEL_PROCESS_OPTIONS,
     "disable_translation",
 ]
 DOCS_TRANSLATION_PROCESS_OPTIONS = [
@@ -28,6 +34,7 @@ DOCS_TRANSLATION_PROCESS_OPTIONS = [
     "gpt-3.5-turbo-0125",
     "gpt-4-turbo-preview",
     *GEMINI_PROCESS_OPTIONS,
+    *GEMINI_TASHKEEL_PROCESS_OPTIONS,
     "disable_translation",
 ]
 
@@ -588,8 +595,15 @@ def parse_gemini_items(raw_text, expected_ids):
     return {i: result[i] for i in expected_ids}
 
 
+def has_tashkeel(text):
+    """True if the text has no Arabic letters to mark, or has diacritics."""
+    letters = len(re.findall(r"[\u0621-\u064A]", text))
+    marks = len(re.findall(r"[\u064B-\u0652]", text))
+    return letters < 3 or marks > 0
+
+
 class GeminiTranslator:
-    def __init__(self, model, target, source=None):
+    def __init__(self, model, target, source=None, tashkeel=False):
         self.api_key = get_gemini_api_key()
         if not self.api_key:
             raise ValueError(
@@ -624,6 +638,24 @@ class GeminiTranslator:
             "spoken language that is easy to read aloud. Do not add "
             "comments or explanations."
         )
+
+        self.tashkeel = bool(tashkeel) and str(target).lower().startswith("ar")
+        if tashkeel and not self.tashkeel:
+            logger.warning(
+                "Tashkeel is only available when the target language is "
+                f"Arabic (target: {target}). Translating without it."
+            )
+        if self.tashkeel:
+            self.system_prompt += (
+                " The target language is Arabic: write Modern Standard "
+                "Arabic and add full tashkeel (diacritics: fatha, damma, "
+                "kasra, sukun, shadda, tanween) to EVERY Arabic word, "
+                "including the case endings (i'rab), so that the text is "
+                "pronounced correctly when read aloud. Also add diacritics "
+                "to Arabic spellings of foreign names. Keep the normal "
+                "punctuation (commas, periods, question marks) where it "
+                "belongs. Digits and non-Arabic text stay unchanged."
+            )
 
     def _request(self, items):
         payload = [{"id": idx, "text": text} for idx, text in items]
@@ -706,14 +738,24 @@ class GeminiTranslator:
 
 
 def gemini_batch(
-    segments, model, target, source=None, batch_size=40, max_chars=6000
+    segments,
+    model,
+    target,
+    source=None,
+    batch_size=40,
+    max_chars=6000,
+    tashkeel=False,
 ):
     """
     Translate segments with the Gemini API in batches.
     Only the 'text' key changes; start, end, speaker, etc. are untouched.
+    With tashkeel=True and an Arabic target, the Arabic text is returned
+    with full diacritics (smaller batches, because the answer is longer).
     """
     segments_copy = copy.deepcopy(segments)
-    translator = GeminiTranslator(model, target, source)
+    translator = GeminiTranslator(model, target, source, tashkeel)
+    if translator.tashkeel:
+        batch_size = min(batch_size, 25)
 
     pending = []
     for idx, segment in enumerate(segments_copy):
@@ -735,6 +777,7 @@ def gemini_batch(
     if current:
         batches.append(current)
 
+    without_tashkeel = 0
     progress_bar = tqdm(total=len(pending), desc="Translating")
     for number, batch in enumerate(batches):
         if number:
@@ -749,8 +792,17 @@ def gemini_batch(
             )
             logger.debug(f"{original} >> {new_text}")
             segments_copy[idx]["text"] = new_text if new_text else original
+            if translator.tashkeel and not has_tashkeel(new_text):
+                without_tashkeel += 1
         progress_bar.update(len(batch))
     progress_bar.close()
+
+    if without_tashkeel:
+        logger.warning(
+            f"{without_tashkeel} of {len(pending)} segments came back "
+            "without tashkeel (the model skipped it, or Google Translate "
+            "was used as fallback)."
+        )
 
     return segments_copy
 
@@ -794,6 +846,16 @@ def translate_text(
                 translation_process.replace("_batch", ""),
                 target,
                 source
+            )
+        case model if model in GEMINI_TASHKEEL_PROCESS_OPTIONS:
+            return gemini_batch(
+                segments,
+                translation_process.replace("_tashkeel", "").replace(
+                    "_batch", ""
+                ),
+                target,
+                source,
+                tashkeel=True
             )
         case "disable_translation":
             return segments
