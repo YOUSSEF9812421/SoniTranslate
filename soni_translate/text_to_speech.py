@@ -599,21 +599,69 @@ def use_nile_tts(lang_code):
     )
 
 
+def _find_nile_files():
+    """Locate checkpoint / config / vocab inside the downloaded folder
+    (searches sub-folders too, in case the repo is organised differently)."""
+    import glob
+
+    all_files = [
+        f for f in glob.glob(os.path.join(NILE_TTS_DIR, "**", "*"),
+                             recursive=True)
+        if os.path.isfile(f)
+    ]
+    logger.info("NileTTS files: " + ", ".join(
+        os.path.relpath(f, NILE_TTS_DIR) for f in all_files))
+
+    def pick(name):
+        for f in all_files:
+            if os.path.basename(f) == name:
+                return f
+        return None
+
+    config = pick("config.json")
+    vocab = pick("vocab.json")
+    pth = [
+        f for f in all_files
+        if f.endswith((".pth", ".pt"))
+        and not any(x in os.path.basename(f).lower()
+                    for x in ("dvae", "mel_stats", "speakers"))
+    ]
+    ckpt = None
+    for preferred in ("model.pth", "best_model.pth"):
+        ckpt = pick(preferred)
+        if ckpt:
+            break
+    if not ckpt and pth:
+        ckpt = max(pth, key=os.path.getsize)  # biggest file = the model
+    speakers = pick("speakers_xtts.pth")
+    if not (config and ckpt):
+        raise TTS_OperationError(
+            "NileTTS: could not find config.json / model checkpoint in "
+            f"{NILE_TTS_DIR}. Files found: {all_files}"
+        )
+    return config, ckpt, vocab, speakers
+
+
 def load_nile_tts_model(device):
     """Download (first time only) and load the Egyptian XTTS model."""
     from huggingface_hub import snapshot_download
     from TTS.tts.configs.xtts_config import XttsConfig
     from TTS.tts.models.xtts import Xtts
 
-    if not os.path.exists(os.path.join(NILE_TTS_DIR, "config.json")):
+    if not os.path.isdir(NILE_TTS_DIR) or not os.listdir(NILE_TTS_DIR):
         logger.info(f"Downloading {NILE_TTS_REPO} ...")
         snapshot_download(NILE_TTS_REPO, local_dir=NILE_TTS_DIR)
 
+    config_path, ckpt_path, vocab_path, speakers_path = _find_nile_files()
     config = XttsConfig()
-    config.load_json(os.path.join(NILE_TTS_DIR, "config.json"))
+    config.load_json(config_path)
     model = Xtts.init_from_config(config)
     model.load_checkpoint(
-        config, checkpoint_dir=NILE_TTS_DIR, use_deepspeed=False
+        config,
+        checkpoint_path=ckpt_path,
+        vocab_path=vocab_path,
+        speaker_file_path=speakers_path,
+        use_deepspeed=False,
     )
     model.to(device)
     model.eval()
@@ -621,17 +669,37 @@ def load_nile_tts_model(device):
 
 
 def nile_tts_infer(model, text, speaker_wav, language="ar", _cache={}):
-    """Generate speech with the Egyptian XTTS model; returns a list of samples."""
+    """Generate speech with the Egyptian XTTS model; returns a list of samples.
+
+    Settings are tuned for a STABLE voice (same gender / pitch every segment):
+    low temperature, narrow sampling, fixed seed and longer reference audio.
+    """
+    import torch
+
     if speaker_wav not in _cache:
         _cache[speaker_wav] = model.get_conditioning_latents(
-            audio_path=[speaker_wav]
+            audio_path=[speaker_wav],
+            gpt_cond_len=30,
+            gpt_cond_chunk_len=6,
+            max_ref_length=60,
         )
     gpt_cond_latent, speaker_embedding = _cache[speaker_wav]
+
+    # same seed for every segment => same voice character every time
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
     out = model.inference(
         text=text,
         language=language,
         gpt_cond_latent=gpt_cond_latent,
         speaker_embedding=speaker_embedding,
+        temperature=0.3,
+        top_k=20,
+        top_p=0.7,
+        repetition_penalty=5.0,
+        enable_text_splitting=True,
     )
     return out["wav"]
 
