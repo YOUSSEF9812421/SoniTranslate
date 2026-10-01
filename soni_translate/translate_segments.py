@@ -826,9 +826,25 @@ def _load_nllb_egyptian():
             "cuda" if torch.cuda.is_available() else "cpu"
         )
         logger.info(f"Loading Egyptian translation model: {NLLB_EGYPTIAN_MODEL}")
-        tokenizer = AutoTokenizer.from_pretrained(
-            NLLB_EGYPTIAN_MODEL, src_lang="eng_Latn"
-        )
+        tokenizer = None
+        # The fast tokenizer.json of this model is saved with a newer
+        # `tokenizers` version, so we try the slow (sentencepiece) one first
+        # and fall back to the original NLLB tokenizer (same vocabulary).
+        for repo, fast in [
+            (NLLB_EGYPTIAN_MODEL, False),
+            ("facebook/nllb-200-distilled-600M", False),
+            (NLLB_EGYPTIAN_MODEL, True),
+        ]:
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    repo, src_lang="eng_Latn", use_fast=fast
+                )
+                logger.info(f"NLLB tokenizer loaded from {repo} (fast={fast})")
+                break
+            except Exception as error:
+                logger.warning(f"Tokenizer {repo} fast={fast} failed: {error}")
+        if tokenizer is None:
+            raise ValueError("Could not load the NLLB tokenizer")
         model = AutoModelForSeq2SeqLM.from_pretrained(NLLB_EGYPTIAN_MODEL)
         model = model.to(device).eval()
         _NLLB_CACHE.update(model=model, tokenizer=tokenizer, device=device)
