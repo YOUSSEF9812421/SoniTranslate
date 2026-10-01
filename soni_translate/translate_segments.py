@@ -912,13 +912,18 @@ def _load_alexandria():
 
     import torch
     from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-    from peft import PeftConfig, PeftModel
+    import json
+    from huggingface_hub import hf_hub_download
+    from peft import PeftModel, LoraConfig
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
 
-    peft_config = PeftConfig.from_pretrained(ALEXANDRIA_MODEL)
-    base_name = peft_config.base_model_name_or_path
+    # Read the adapter config by hand (works with old and new peft versions)
+    cfg_path = hf_hub_download(ALEXANDRIA_MODEL, "adapter_config.json")
+    with open(cfg_path, encoding="utf8") as f:
+        adapter_cfg = json.load(f)
+    base_name = adapter_cfg["base_model_name_or_path"]
     logger.info(f"AlexandriaX base model: {base_name}")
 
     tokenizer = None
@@ -935,7 +940,20 @@ def _load_alexandria():
         raise ValueError("Could not load the AlexandriaX tokenizer")
 
     base = AutoModelForSeq2SeqLM.from_pretrained(base_name, torch_dtype=dtype)
-    model = PeftModel.from_pretrained(base, ALEXANDRIA_MODEL)
+    try:
+        model = PeftModel.from_pretrained(base, ALEXANDRIA_MODEL)
+    except Exception as error:
+        # Old peft versions do not know some newer config keys: drop them.
+        logger.warning(f"Loading adapter with filtered config ({error})")
+        import inspect
+        allowed = set(inspect.signature(LoraConfig.__init__).parameters)
+        clean = {k: v for k, v in adapter_cfg.items() if k in allowed}
+        clean.pop("peft_type", None)
+        clean.pop("auto_mapping", None)
+        lora_config = LoraConfig(**clean)
+        model = PeftModel.from_pretrained(
+            base, ALEXANDRIA_MODEL, config=lora_config
+        )
     model = model.merge_and_unload().to(device).eval()
 
     _ALEX_CACHE.update(model=model, tokenizer=tokenizer, device=device)
