@@ -656,13 +656,21 @@ def load_nile_tts_model(device):
     config = XttsConfig()
     config.load_json(config_path)
     model = Xtts.init_from_config(config)
-    model.load_checkpoint(
-        config,
-        checkpoint_path=ckpt_path,
-        vocab_path=vocab_path,
-        speaker_file_path=speakers_path,
-        use_deepspeed=False,
-    )
+    import inspect
+
+    # Pass only the arguments supported by the installed TTS version
+    supported = inspect.signature(model.load_checkpoint).parameters
+    kwargs = {
+        "checkpoint_path": ckpt_path,
+        "vocab_path": vocab_path,
+        "speaker_file_path": speakers_path,
+        "use_deepspeed": False,
+    }
+    kwargs = {
+        k: v for k, v in kwargs.items()
+        if k in supported and v is not None
+    }
+    model.load_checkpoint(config, **kwargs)
     model.to(device)
     model.eval()
     return model
