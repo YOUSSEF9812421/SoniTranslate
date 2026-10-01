@@ -505,6 +505,48 @@ OPENAI_TTS_MODELS = [
     ">shimmer HD OpenAI-TTS"
 ]
 
+# Gemini TTS prebuilt voices (Google AI Studio).
+# (voice name, gender, energetic?) Gender: Google Cloud TTS docs (same voice
+# names). Energetic = Google's descriptor is Upbeat/Excitable/Bright/Lively.
+GEMINI_TTS_VOICES = [
+    ("Zephyr", "بنت", "حماسي"),
+    ("Puck", "ولد", "حماسي"),
+    ("Charon", "ولد", "هادي"),
+    ("Kore", "بنت", "هادي"),
+    ("Fenrir", "ولد", "حماسي"),
+    ("Leda", "بنت", "هادي"),
+    ("Orus", "ولد", "هادي"),
+    ("Aoede", "بنت", "هادي"),
+    ("Callirrhoe", "بنت", "هادي"),
+    ("Autonoe", "بنت", "حماسي"),
+    ("Enceladus", "ولد", "هادي"),
+    ("Iapetus", "ولد", "هادي"),
+    ("Umbriel", "ولد", "هادي"),
+    ("Algieba", "ولد", "هادي"),
+    ("Despina", "بنت", "هادي"),
+    ("Erinome", "بنت", "هادي"),
+    ("Algenib", "ولد", "هادي"),
+    ("Rasalgethi", "ولد", "هادي"),
+    ("Laomedeia", "بنت", "حماسي"),
+    ("Achernar", "بنت", "هادي"),
+    ("Alnilam", "ولد", "هادي"),
+    ("Schedar", "ولد", "هادي"),
+    ("Gacrux", "بنت", "هادي"),
+    ("Pulcherrima", "بنت", "هادي"),
+    ("Achird", "ولد", "هادي"),
+    ("Zubenelgenubi", "ولد", "هادي"),
+    ("Vindemiatrix", "بنت", "هادي"),
+    ("Sadachbia", "ولد", "حماسي"),
+    ("Sadaltager", "ولد", "هادي"),
+    ("Sulafat", "بنت", "هادي"),
+]
+
+# Dropdown format: ">Sadaltager (ولد - هادي) JOE"
+GEMINI_TTS_MODELS = [
+    f">{name} ({gender} - {energy}) JOE"
+    for name, gender, energy in GEMINI_TTS_VOICES
+]
+
 LANGUAGE_CODE_IN_THREE_LETTERS = {
     "Automatic detection": "aut",
     "ar": "ara",
