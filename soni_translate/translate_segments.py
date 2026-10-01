@@ -28,6 +28,7 @@ TRANSLATION_PROCESS_OPTIONS = [
     *GEMINI_PROCESS_OPTIONS,
     *GEMINI_TASHKEEL_PROCESS_OPTIONS,
     "nllb_egyptian_en_to_arz",
+    "alexandriax_nllb_1.3b_lora",
     "disable_translation",
 ]
 DOCS_TRANSLATION_PROCESS_OPTIONS = [
@@ -892,6 +893,99 @@ def nllb_egyptian_translate(segments, batch_size=16):
     return segments_
 
 
+# =====================================
+# AlexandriaX NLLB 1.3B (LoRA adapter)
+# Model: NAMAA-Space/alexandriax-nllb-1.3b-lora
+# The base model is read automatically from the adapter's config.
+# Target language code can be changed with the env var
+# SONITR_ALEXANDRIA_TGT (default: arz_Arab = Egyptian Arabic,
+# use arb_Arab for Modern Standard Arabic).
+# =====================================
+ALEXANDRIA_MODEL = "NAMAA-Space/alexandriax-nllb-1.3b-lora"
+_ALEX_CACHE = {}
+
+
+def _load_alexandria():
+    if "model" in _ALEX_CACHE:
+        return (_ALEX_CACHE["model"], _ALEX_CACHE["tokenizer"],
+                _ALEX_CACHE["device"])
+
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+    from peft import PeftConfig, PeftModel
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+
+    peft_config = PeftConfig.from_pretrained(ALEXANDRIA_MODEL)
+    base_name = peft_config.base_model_name_or_path
+    logger.info(f"AlexandriaX base model: {base_name}")
+
+    tokenizer = None
+    for repo in (ALEXANDRIA_MODEL, base_name):
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                repo, src_lang="eng_Latn", use_fast=False
+            )
+            logger.info(f"AlexandriaX tokenizer loaded from {repo}")
+            break
+        except Exception as error:
+            logger.warning(f"Tokenizer {repo} failed: {error}")
+    if tokenizer is None:
+        raise ValueError("Could not load the AlexandriaX tokenizer")
+
+    base = AutoModelForSeq2SeqLM.from_pretrained(base_name, torch_dtype=dtype)
+    model = PeftModel.from_pretrained(base, ALEXANDRIA_MODEL)
+    model = model.merge_and_unload().to(device).eval()
+
+    _ALEX_CACHE.update(model=model, tokenizer=tokenizer, device=device)
+    return model, tokenizer, device
+
+
+def alexandria_translate(segments, batch_size=8):
+    """Translate English segments to Arabic with AlexandriaX NLLB LoRA."""
+    import torch
+
+    segments_ = copy.deepcopy(segments)
+    model, tokenizer, device = _load_alexandria()
+
+    tgt_code = os.environ.get("SONITR_ALEXANDRIA_TGT", "arz_Arab")
+    bos_id = tokenizer.convert_tokens_to_ids(tgt_code)
+    if bos_id is None or bos_id == tokenizer.unk_token_id:
+        raise ValueError(f"Unknown target language code: {tgt_code}")
+    logger.info(f"AlexandriaX target language code: {tgt_code}")
+
+    texts = [seg["text"].strip() for seg in segments_]
+    results = []
+    for i in tqdm(range(0, len(texts), batch_size)):
+        batch = texts[i:i + batch_size]
+        inputs = tokenizer(
+            batch, return_tensors="pt", padding=True,
+            truncation=True, max_length=256,
+        ).to(device)
+        with torch.no_grad():
+            out = model.generate(
+                **inputs,
+                forced_bos_token_id=bos_id,
+                max_length=256,
+                num_beams=4,
+            )
+        results.extend(tokenizer.batch_decode(out, skip_special_tokens=True))
+
+    for seg, original, translated in zip(segments_, texts, results):
+        logger.debug(f"{original} >> {translated}")
+        seg["text"] = translated.strip()
+
+    try:
+        import gc
+        _ALEX_CACHE.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    return segments_
+
+
 def translate_text(
     segments,
     target,
@@ -952,6 +1046,16 @@ def translate_text(
                 )
                 return translate_batch(segments, tgt, chunk_size, src)
             return nllb_egyptian_translate(segments)
+        case "alexandriax_nllb_1.3b_lora":
+            src = fix_code_language(source) if source else "en"
+            tgt = fix_code_language(target)
+            if src != "en" or not str(tgt).startswith("ar"):
+                logger.error(
+                    "alexandriax_nllb_1.3b_lora is set up for English -> "
+                    "Arabic. Falling back to Google Translate."
+                )
+                return translate_batch(segments, tgt, chunk_size, src)
+            return alexandria_translate(segments)
         case "disable_translation":
             return segments
         case _:
