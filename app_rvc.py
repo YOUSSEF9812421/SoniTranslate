@@ -40,6 +40,7 @@ from soni_translate.language_configuration import (
     BARK_VOICES_LIST,
     VITS_VOICES_LIST,
     OPENAI_TTS_MODELS,
+    GEMINI_TTS_MODELS,
 )
 from soni_translate.utils import (
     remove_files,
@@ -120,6 +121,7 @@ class TTS_Info:
         self.list_bark = list(BARK_VOICES_LIST.keys())
         self.list_vits = list(VITS_VOICES_LIST.keys())
         self.list_openai_tts = OPENAI_TTS_MODELS
+        self.list_gemini_tts = GEMINI_TTS_MODELS
         self.piper_enabled = piper_enabled
         self.list_vits_onnx = (
             piper_tts_voices_list() if self.piper_enabled else []
@@ -135,6 +137,7 @@ class TTS_Info:
             + self.list_bark
             + self.list_vits
             + self.list_openai_tts
+            + self.list_gemini_tts
             + self.list_vits_onnx
         )
         return list_tts
@@ -466,6 +469,16 @@ class SoniTranslate(SoniTrCache):
             check_openai_api_key()
 
         if "gemini" in translate_process:
+            check_gemini_api_key()
+
+        if any(
+            isinstance(voice, str) and voice.endswith(" JOE")
+            for voice in [
+                tts_voice00, tts_voice01, tts_voice02, tts_voice03,
+                tts_voice04, tts_voice05, tts_voice06, tts_voice07,
+                tts_voice08, tts_voice09, tts_voice10, tts_voice11,
+            ]
+        ):
             check_gemini_api_key()
 
         if media_file is None:
@@ -1187,6 +1200,9 @@ class SoniTranslate(SoniTrCache):
         is_gui,
         progress
     ):
+        if isinstance(tts, str) and tts.endswith(" JOE"):
+            check_gemini_api_key()
+
         prog_disp("Processing pages...", 0.10, is_gui, progress=progress)
         doc_data = doc_to_txtximg_pages(document,  width, height, start_page, end_page, bcolor)
         result_diarize = page_data_to_segments(doc_data, 1700)
@@ -1293,6 +1309,9 @@ class SoniTranslate(SoniTrCache):
             check_openai_api_key()
 
         if "gemini" in translate_process:
+            check_gemini_api_key()
+
+        if isinstance(tts_voice00, str) and tts_voice00.endswith(" JOE"):
             check_gemini_api_key()
 
         SOURCE_LANGUAGE = LANGUAGES[origin_language]
