@@ -268,6 +268,18 @@ def check_openai_api_key():
         )
 
 
+def check_gemini_api_key():
+    if not (
+        os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    ):
+        raise ValueError(
+            "To use Gemini for translation, please set up your Gemini API "
+            "key as an environment variable GEMINI_API_KEY (get it from "
+            "Google AI Studio). Or change the translation process in "
+            "Advanced settings."
+        )
+
+
 class SoniTranslate(SoniTrCache):
     def __init__(self, cpu_mode=False):
         super().__init__()
@@ -452,6 +464,9 @@ class SoniTranslate(SoniTrCache):
             or "OpenAI-TTS" in tts_voice00
         ):
             check_openai_api_key()
+
+        if "gemini" in translate_process:
+            check_gemini_api_key()
 
         if media_file is None:
             media_file = (
@@ -1276,6 +1291,9 @@ class SoniTranslate(SoniTrCache):
     ):
         if "gpt" in translate_process:
             check_openai_api_key()
+
+        if "gemini" in translate_process:
+            check_gemini_api_key()
 
         SOURCE_LANGUAGE = LANGUAGES[origin_language]
         if translate_process != "disable_translation":
