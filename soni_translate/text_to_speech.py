@@ -582,6 +582,60 @@ def create_new_files_for_vc(
                     )
 
 
+# =====================================
+# Egyptian Arabic XTTS (NileTTS)
+# Model: KickItLikeShika/NileTTS-XTTS
+# Enabled automatically when the target language is Arabic.
+# To disable: set the environment variable SONITR_NILE_TTS=0
+# =====================================
+NILE_TTS_REPO = "KickItLikeShika/NileTTS-XTTS"
+NILE_TTS_DIR = "models/nile_tts"
+
+
+def use_nile_tts(lang_code):
+    return (
+        lang_code == "ar"
+        and os.environ.get("SONITR_NILE_TTS", "1") != "0"
+    )
+
+
+def load_nile_tts_model(device):
+    """Download (first time only) and load the Egyptian XTTS model."""
+    from huggingface_hub import snapshot_download
+    from TTS.tts.configs.xtts_config import XttsConfig
+    from TTS.tts.models.xtts import Xtts
+
+    if not os.path.exists(os.path.join(NILE_TTS_DIR, "config.json")):
+        logger.info(f"Downloading {NILE_TTS_REPO} ...")
+        snapshot_download(NILE_TTS_REPO, local_dir=NILE_TTS_DIR)
+
+    config = XttsConfig()
+    config.load_json(os.path.join(NILE_TTS_DIR, "config.json"))
+    model = Xtts.init_from_config(config)
+    model.load_checkpoint(
+        config, checkpoint_dir=NILE_TTS_DIR, use_deepspeed=False
+    )
+    model.to(device)
+    model.eval()
+    return model
+
+
+def nile_tts_infer(model, text, speaker_wav, language="ar", _cache={}):
+    """Generate speech with the Egyptian XTTS model; returns a list of samples."""
+    if speaker_wav not in _cache:
+        _cache[speaker_wav] = model.get_conditioning_latents(
+            audio_path=[speaker_wav]
+        )
+    gpt_cond_latent, speaker_embedding = _cache[speaker_wav]
+    out = model.inference(
+        text=text,
+        language=language,
+        gpt_cond_latent=gpt_cond_latent,
+        speaker_embedding=speaker_embedding,
+    )
+    return out["wav"]
+
+
 def segments_coqui_tts(
     filtered_coqui_segments,
     TRANSLATE_AUDIO_TO,
@@ -641,7 +695,11 @@ def segments_coqui_tts(
 
     # Init TTS
     device = os.environ.get("SONITR_DEVICE")
-    model = TTS(model_id_coqui).to(device)
+    nile_mode = use_nile_tts(TRANSLATE_AUDIO_TO)
+    if nile_mode:
+        model = load_nile_tts_model(device)
+    else:
+        model = TTS(model_id_coqui).to(device)
     sampling_rate = 24000
 
     # filtered_segments = filtered_coqui_segments['segments']
@@ -662,9 +720,15 @@ def segments_coqui_tts(
         logger.info(f"{text} >> {filename}")
         try:
             # Infer
-            wav = model.tts(
-                text=text, speaker_wav=tts_name, language=TRANSLATE_AUDIO_TO
-            )
+            if nile_mode:
+                wav = nile_tts_infer(
+                    model, text, tts_name, TRANSLATE_AUDIO_TO
+                )
+            else:
+                wav = model.tts(
+                    text=text, speaker_wav=tts_name,
+                    language=TRANSLATE_AUDIO_TO
+                )
             data_tts = pad_array(
                 wav,
                 sampling_rate,
