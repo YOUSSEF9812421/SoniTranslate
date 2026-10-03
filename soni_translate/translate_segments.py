@@ -9,6 +9,12 @@ import json
 import time
 import os
 
+# MADLAD-400 3B (CTranslate2) - local model, any language -> any language
+MADLAD_PROCESS_OPTIONS = [
+    "madlad400_3b_ct2",
+    "madlad400_3b_ct2_arz",  # Arabic target = Egyptian Arabic (<2arz>)
+]
+
 GEMINI_PROCESS_OPTIONS = [
     "gemini-3.8-flash_batch",
     "gemini-3.5-flash-lite_batch",
@@ -29,6 +35,7 @@ TRANSLATION_PROCESS_OPTIONS = [
     *GEMINI_TASHKEEL_PROCESS_OPTIONS,
     "nllb_egyptian_en_to_arz",
     "alexandriax_nllb_1.3b_lora",
+    *MADLAD_PROCESS_OPTIONS,
     "disable_translation",
 ]
 DOCS_TRANSLATION_PROCESS_OPTIONS = [
@@ -1004,6 +1011,142 @@ def alexandria_translate(segments, batch_size=8):
     return segments_
 
 
+# =====================================
+# MADLAD-400 3B (CTranslate2)
+# Model: santhosh/madlad400-3b-ct2
+# The target language is chosen with a token at the start of the text,
+# e.g. "<2ar> Hello". The source language is not needed.
+# Optional env vars (generation settings):
+#   SONITR_MADLAD_BEAM (default 4), SONITR_MADLAD_REP_PENALTY (1.1),
+#   SONITR_MADLAD_NO_REPEAT (0 = off), SONITR_MADLAD_COMPUTE (auto)
+#   SONITR_DEVICE (cuda / cpu) is shared with the other local models.
+# =====================================
+MADLAD_REPO = "santhosh/madlad400-3b-ct2"
+_MADLAD_CACHE = {}
+# SoniTranslate code -> MADLAD language token (the rest are identical)
+MADLAD_CODE_FIXES = {
+    "jw": "jv",
+    "tl": "fil",
+    "zh-TW": "zh_Hant",
+    "zh-CN": "zh",
+    "zh-cn": "zh",
+}
+
+
+def _load_madlad():
+    """Load the model once and keep it in memory (lazy loading)."""
+    if "translator" in _MADLAD_CACHE:
+        return _MADLAD_CACHE["translator"], _MADLAD_CACHE["tokenizer"]
+
+    try:
+        import ctranslate2
+        from sentencepiece import SentencePieceProcessor
+        from huggingface_hub import snapshot_download
+    except ImportError as error:
+        raise ImportError(
+            f"MADLAD needs the packages ctranslate2, sentencepiece and "
+            f"huggingface_hub ({error}). Install them with: "
+            f"pip install ctranslate2 sentencepiece huggingface_hub"
+        )
+
+    device = os.environ.get("SONITR_DEVICE") or (
+        "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+    )
+    compute_type = os.environ.get("SONITR_MADLAD_COMPUTE", "auto")
+    logger.info(f"Loading {MADLAD_REPO} (first time it downloads ~3 GB)")
+    model_path = snapshot_download(MADLAD_REPO)
+
+    tokenizer = SentencePieceProcessor()
+    tokenizer.load(os.path.join(model_path, "sentencepiece.model"))
+    translator = ctranslate2.Translator(
+        model_path, device=device, compute_type=compute_type
+    )
+    logger.info(f"MADLAD loaded on {device} (compute_type={compute_type})")
+    _MADLAD_CACHE.update(translator=translator, tokenizer=tokenizer)
+    return translator, tokenizer
+
+
+def _free_madlad():
+    """Free the memory for the next steps (TTS)."""
+    try:
+        import gc
+        _MADLAD_CACHE.clear()
+        gc.collect()
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def madlad_language_token(tokenizer, target, egyptian=False):
+    """Return the '<2xx>' token for the target language (checked)."""
+    code = str(target)
+    if egyptian:
+        if code.lower().startswith("ar"):
+            code = "arz"
+        else:
+            logger.warning(
+                "madlad400_3b_ct2_arz only changes Arabic targets; "
+                f"translating to '{target}' normally."
+            )
+    code = MADLAD_CODE_FIXES.get(code, code)
+    token = f"<2{code}>"
+    if tokenizer.piece_to_id(token) == tokenizer.unk_id():
+        raise ValueError(
+            f"MADLAD has no language token {token} for the target "
+            f"language '{target}'."
+        )
+    return token
+
+
+def madlad_translate(segments, target, egyptian=False, batch_size=32):
+    """Translate segments with MADLAD-400 3B (any source language)."""
+    segments_ = copy.deepcopy(segments)
+    translator, tokenizer = _load_madlad()
+
+    try:
+        token = madlad_language_token(tokenizer, target, egyptian)
+        logger.info(f"MADLAD target token: {token}")
+
+        beam_size = int(os.environ.get("SONITR_MADLAD_BEAM", "4"))
+        rep_penalty = float(os.environ.get("SONITR_MADLAD_REP_PENALTY", "1.1"))
+        no_repeat = int(os.environ.get("SONITR_MADLAD_NO_REPEAT", "0"))
+
+        pending = []
+        for idx, segment in enumerate(segments_):
+            text = str(segment.get("text", "")).strip()
+            if text:
+                pending.append((idx, text))
+
+        for start in tqdm(range(0, len(pending), batch_size)):
+            batch = pending[start:start + batch_size]
+            inputs = [
+                tokenizer.encode(f"{token} {text}", out_type=str)
+                for _, text in batch
+            ]
+            results = translator.translate_batch(
+                inputs,
+                batch_type="tokens",
+                max_batch_size=1024,
+                beam_size=beam_size,
+                no_repeat_ngram_size=no_repeat,
+                repetition_penalty=rep_penalty,
+            )
+            for (idx, text), result in zip(batch, results):
+                new_text = (
+                    tokenizer.decode(result.hypotheses[0])
+                    .replace("\t", " ")
+                    .replace("\n", " ")
+                    .strip()
+                )
+                logger.debug(f"{text} >> {new_text}")
+                segments_[idx]["text"] = new_text if new_text else text
+    finally:
+        _free_madlad()
+
+    return segments_
+
+
 def translate_text(
     segments,
     target,
@@ -1074,6 +1217,12 @@ def translate_text(
                 )
                 return translate_batch(segments, tgt, chunk_size, src)
             return alexandria_translate(segments)
+        case model if model in MADLAD_PROCESS_OPTIONS:
+            return madlad_translate(
+                segments,
+                target,
+                egyptian=(translation_process == "madlad400_3b_ct2_arz"),
+            )
         case "disable_translation":
             return segments
         case _:
