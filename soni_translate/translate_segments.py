@@ -1046,7 +1046,9 @@ def _load_madlad():
         raise ImportError(
             f"MADLAD needs the packages ctranslate2, sentencepiece and "
             f"huggingface_hub ({error}). Install them with: "
-            f"pip install ctranslate2 sentencepiece huggingface_hub"
+            f'pip install "ctranslate2<=4.4.0" sentencepiece '
+            f'"huggingface_hub<1.0" (do not upgrade huggingface_hub to 1.x: '
+            f"gradio 4.x stops working)"
         )
 
     device = os.environ.get("SONITR_DEVICE") or (
