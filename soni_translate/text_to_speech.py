@@ -1240,6 +1240,203 @@ def segments_gemini_tts(filtered_gemini_tts_segments, TRANSLATE_AUDIO_TO):
 
 
 # =====================================
+# NAMAA EGYPTIAN TTS (Chatterbox)
+# Model: NAMAA-Space/NAMAA-Egyptian-TTS
+# It runs in its OWN Python environment (chatterbox-tts needs other versions
+# of torch / transformers than SoniTranslate), as a separate process that
+# executes soni_translate/namaa_worker.py.
+# Optional environment variables:
+#   SONITR_NAMAA_PYTHON            path of the python of that environment
+#   SONITR_NAMAA_STRIP_TASHKEEL=0  keep the Arabic diacritics in the text
+# =====================================
+NAMAA_WORKER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "namaa_worker.py"
+)
+NAMAA_SETUP_HELP = (
+    "NAMAA Egyptian TTS needs its own Python environment (it cannot be "
+    "installed inside the SoniTranslate environment). Run the NAMAA setup "
+    "cell in the notebook:\n"
+    "  !uv venv /kaggle/working/cb_env --python 3.11\n"
+    "  !uv pip install --python /kaggle/working/cb_env/bin/python "
+    "chatterbox-tts \"setuptools<82\"\n"
+    "Or set SONITR_NAMAA_PYTHON to the python of that environment. "
+    "Otherwise choose another TTS voice."
+)
+
+
+def find_namaa_python():
+    """Python of the NAMAA environment, or None if it does not exist."""
+    def valid(path):
+        return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+    custom = os.environ.get("SONITR_NAMAA_PYTHON")
+    if custom:
+        return custom if valid(custom) else None
+
+    project_root = os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))
+    )
+    for candidate in (
+        "/kaggle/working/cb_env/bin/python",
+        os.path.join(project_root, "cb_env", "bin", "python"),
+        os.path.join(os.getcwd(), "cb_env", "bin", "python"),
+    ):
+        if valid(candidate):
+            return candidate
+    return None
+
+
+def check_namaa_environment():
+    """Raise a clear error (before any long processing) if NAMAA can't run."""
+    python_path = find_namaa_python()
+    if python_path is None:
+        raise TTS_OperationError(
+            "NAMAA environment not found. " + NAMAA_SETUP_HELP
+        )
+    if not os.path.isfile(NAMAA_WORKER):
+        raise TTS_OperationError(
+            f"NAMAA worker file is missing: {NAMAA_WORKER}. Upload "
+            "soni_translate/namaa_worker.py to the project."
+        )
+    return python_path
+
+
+def segments_namaa_tts(filtered_namaa_segments, TRANSLATE_AUDIO_TO):
+    import json
+    import shutil
+    import tempfile
+    from collections import deque
+
+    python_path = check_namaa_environment()
+    segments = filtered_namaa_segments["segments"]
+
+    tmp_dir = tempfile.mkdtemp(prefix="namaa_tts_")
+    items = []
+    for index, segment in enumerate(segments):
+        text = str(segment.get("text", "")).strip()
+        items.append({
+            "id": index,
+            "text": text,
+            "out": os.path.join(tmp_dir, f"{index}.wav"),
+        })
+    to_generate = [item for item in items if item["text"]]
+
+    process = None
+    try:
+        fatal_message = None
+        tail = deque(maxlen=30)
+        code = 0
+        if to_generate:
+            jobs_path = os.path.join(tmp_dir, "jobs.json")
+            with open(jobs_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"device": "auto", "items": to_generate},
+                    f, ensure_ascii=False,
+                )
+
+            env = os.environ.copy()
+            env.pop("PYTHONPATH", None)
+            env.pop("PYTHONHOME", None)
+            env["PYTHONUNBUFFERED"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
+            logger.info(
+                f"NAMAA TTS: {len(to_generate)} segments "
+                f"(python: {python_path})"
+            )
+            process = subprocess.Popen(
+                [python_path, NAMAA_WORKER, jobs_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                bufsize=1,
+            )
+            progress_bar = tqdm(total=len(to_generate), desc="NAMAA TTS")
+            for line in process.stdout:
+                line = line.strip()
+                if line.startswith("NAMAA_PROGRESS"):
+                    try:
+                        done = int(line.split()[1].split("/")[0])
+                        progress_bar.update(done - progress_bar.n)
+                    except (IndexError, ValueError):
+                        pass
+                elif line.startswith("NAMAA_STATUS"):
+                    logger.info(line)
+                elif line.startswith("NAMAA_ITEM_ERROR"):
+                    logger.warning(line)
+                elif line.startswith("NAMAA_FATAL"):
+                    fatal_message = line[len("NAMAA_FATAL"):].strip()
+                    logger.error(line)
+                elif line:
+                    tail.append(line[:300])
+            progress_bar.close()
+            code = process.wait()
+
+        produced = [os.path.exists(item["out"]) for item in items]
+        if to_generate and not any(produced):
+            raise TTS_OperationError(
+                "NAMAA TTS produced no audio"
+                + (f": {fatal_message}" if fatal_message else
+                   f" (exit code {code})")
+                + ("\nLast output of the NAMAA process:\n"
+                   + "\n".join(tail) if tail else "")
+            )
+        if code != 0:
+            logger.warning(
+                f"NAMAA process ended with exit code {code}; segments "
+                "without audio will use the auxiliary TTS."
+            )
+
+        for segment, item in zip(segments, items):
+            start = segment["start"]
+            filename = f"audio/{start}.ogg"
+            logger.info(f"{item['text']} >> {filename}")
+            try:
+                if not item["text"]:
+                    # empty text: silence with the duration of the segment
+                    duration = float(segment["end"]) - float(start)
+                    sample_rate = 24000
+                    audio = np.zeros(
+                        max(1, int(sample_rate * duration)), dtype=np.float32
+                    )
+                    write_chunked(
+                        file=filename, samplerate=sample_rate, data=audio,
+                        format="ogg", subtype="vorbis",
+                    )
+                else:
+                    if not os.path.exists(item["out"]):
+                        raise TTS_OperationError(
+                            "NAMAA did not generate audio for this segment"
+                        )
+                    audio, sample_rate = sf.read(item["out"], dtype="float32")
+                    if audio.ndim > 1:
+                        audio = audio.mean(axis=1)
+                    data_tts = pad_array(audio, sample_rate)
+                    write_chunked(
+                        file=filename, samplerate=sample_rate,
+                        data=data_tts, format="ogg", subtype="vorbis",
+                    )
+                verify_saved_file_and_size(filename)
+            except Exception as error:
+                error_handling_in_tts(
+                    error, segment, TRANSLATE_AUDIO_TO, filename
+                )
+    finally:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# =====================================
 # Select task TTS
 # =====================================
 
@@ -1323,6 +1520,7 @@ def audio_segmentation_to_voice(
     pattern_vits_onnx = re.compile(r".* VITS-onnx$")
     pattern_openai_tts = re.compile(r".* OpenAI-TTS$")
     pattern_gemini_tts = re.compile(r".* JOE$")
+    pattern_namaa_tts = re.compile(r".* NAMAA-TTS$")
 
     all_segments = result_diarize["segments"]
 
@@ -1339,6 +1537,9 @@ def audio_segmentation_to_voice(
     speakers_gemini_tts = find_spkr(
         pattern_gemini_tts, speaker_to_voice, all_segments
     )
+    speakers_namaa_tts = find_spkr(
+        pattern_namaa_tts, speaker_to_voice, all_segments
+    )
 
     # Filter method in segments
     filtered_edge = filter_by_speaker(speakers_edge, all_segments)
@@ -1348,6 +1549,7 @@ def audio_segmentation_to_voice(
     filtered_vits_onnx = filter_by_speaker(speakers_vits_onnx, all_segments)
     filtered_openai_tts = filter_by_speaker(speakers_openai_tts, all_segments)
     filtered_gemini_tts = filter_by_speaker(speakers_gemini_tts, all_segments)
+    filtered_namaa_tts = filter_by_speaker(speakers_namaa_tts, all_segments)
 
     # Infer
     if filtered_edge["segments"]:
@@ -1380,6 +1582,9 @@ def audio_segmentation_to_voice(
     if filtered_gemini_tts["segments"]:
         logger.info(f"Gemini TTS: {speakers_gemini_tts}")
         segments_gemini_tts(filtered_gemini_tts, TRANSLATE_AUDIO_TO)  # ogg
+    if filtered_namaa_tts["segments"]:
+        logger.info(f"NAMAA TTS: {speakers_namaa_tts}")
+        segments_namaa_tts(filtered_namaa_tts, TRANSLATE_AUDIO_TO)  # ogg
 
     [result.pop("tts_name", None) for result in result_diarize["segments"]]
     return [
@@ -1389,7 +1594,8 @@ def audio_segmentation_to_voice(
         speakers_coqui,
         speakers_vits_onnx,
         speakers_openai_tts,
-        speakers_gemini_tts
+        speakers_gemini_tts,
+        speakers_namaa_tts
     ]
 
 
