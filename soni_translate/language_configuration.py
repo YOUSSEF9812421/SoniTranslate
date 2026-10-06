@@ -547,6 +547,10 @@ GEMINI_TTS_MODELS = [
     for name, gender, energy in GEMINI_TTS_VOICES
 ]
 
+# NAMAA Egyptian TTS (Chatterbox, runs in its own Python environment).
+# One voice: the default Chatterbox voice speaking Egyptian Arabic.
+NAMAA_TTS_MODELS = [">Egyptian-Default NAMAA-TTS"]
+
 LANGUAGE_CODE_IN_THREE_LETTERS = {
     "Automatic detection": "aut",
     "ar": "ara",
