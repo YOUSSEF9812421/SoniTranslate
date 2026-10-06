@@ -237,6 +237,7 @@ def determine_chunk_size(file_name):
         re.compile(r".* VITS-onnx$"): 250,  # automatic sentence split
         re.compile(r".* OpenAI-TTS$"): 1024,  # max charaters 4096
         re.compile(r".* JOE$"): 1024,  # Gemini TTS
+        re.compile(r".* NAMAA-TTS$"): 400,  # NAMAA Egyptian TTS
     }
 
     for pattern, chunk_size in patterns.items():
