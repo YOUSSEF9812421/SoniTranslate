@@ -79,6 +79,7 @@ def get_output_file(
         new_file_name,
         soft_subtitles,
         output_directory="",
+        subs_dir="",
 ):
     directory_base = "."  # default directory
 
@@ -89,11 +90,13 @@ def get_output_file(
     remove_files(new_file_path)
 
     cm = None
+    sub_tra_srt = os.path.join(subs_dir, "sub_tra.srt") if subs_dir else "sub_tra.srt"
+    sub_ori_srt = os.path.join(subs_dir, "sub_ori.srt") if subs_dir else "sub_ori.srt"
     if soft_subtitles and original_file.endswith(".mp4"):
         if new_file_path.endswith(".mp4"):
-            cm = f'ffmpeg -y -i "{original_file}" -i sub_tra.srt -i sub_ori.srt -map 0:v -map 0:a -map 1 -map 2 -c:v copy -c:a copy -c:s mov_text "{new_file_path}"'
+            cm = f'ffmpeg -y -i "{original_file}" -i {sub_tra_srt} -i {sub_ori_srt} -map 0:v -map 0:a -map 1 -map 2 -c:v copy -c:a copy -c:s mov_text "{new_file_path}"'
         else:
-            cm = f'ffmpeg -y -i "{original_file}" -i sub_tra.srt -i sub_ori.srt -map 0:v -map 0:a -map 1 -map 2 -c:v copy -c:a copy -c:s srt -movflags use_metadata_tags -map_metadata 0 "{new_file_path}"'
+            cm = f'ffmpeg -y -i "{original_file}" -i {sub_tra_srt} -i {sub_ori_srt} -map 0:v -map 0:a -map 1 -map 2 -c:v copy -c:a copy -c:s srt -movflags use_metadata_tags -map_metadata 0 "{new_file_path}"'
     elif new_file_path.endswith(".mkv"):
         cm = f'ffmpeg -i "{original_file}" -c:v copy -c:a copy "{new_file_path}"'
     elif new_file_path.endswith(".wav") and not original_file.endswith(".wav"):
@@ -124,6 +127,7 @@ def media_out(
     file_obj="video_dub.mp4",
     soft_subtitles=False,
     subtitle_files="disable",
+    subs_dir="",
 ):
     if media_out_name:
         base_name = media_out_name + "_origin"
@@ -138,18 +142,24 @@ def media_out(
     f_name = f"{sanitize_file_name(media_out_name)}.{extension}"
 
     if subtitle_files != "disable":
-        final_media = [get_output_file(file_obj, f_name, soft_subtitles)]
+        final_media = [
+            get_output_file(
+                file_obj, f_name, soft_subtitles, subs_dir=subs_dir
+            )
+        ]
         name_tra = f"{sanitize_file_name(media_out_name)}.{subtitle_files}"
         name_ori = f"{sanitize_file_name(base_name)}.{subtitle_files}"
-        tgt_subs = f"sub_tra.{subtitle_files}"
-        ori_subs = f"sub_ori.{subtitle_files}"
+        tgt_subs = os.path.join(subs_dir, f"sub_tra.{subtitle_files}")
+        ori_subs = os.path.join(subs_dir, f"sub_ori.{subtitle_files}")
         final_subtitles = [
             get_output_file(tgt_subs, name_tra, False),
             get_output_file(ori_subs, name_ori, False)
         ]
         return final_media + final_subtitles
     else:
-        return get_output_file(file_obj, f_name, soft_subtitles)
+        return get_output_file(
+            file_obj, f_name, soft_subtitles, subs_dir=subs_dir
+        )
 
 
 def get_subtitle_speaker(media_file, result, language, extension, base_name):
