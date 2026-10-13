@@ -8,6 +8,13 @@ import whisperx
 import torch
 import os
 from soni_translate.audio_segments import create_translated_audio
+from soni_translate.video_stretch import (
+    probe_video,
+    build_pieces,
+    render_video,
+    render_background_audio,
+    remap_subtitle_set,
+)
 from soni_translate.text_to_speech import (
     audio_segmentation_to_voice,
     edge_tts_voices_list,
@@ -452,6 +459,8 @@ class SoniTranslate(SoniTrCache):
         enable_cache=True,
         custom_voices=False,
         custom_voices_workers=1,
+        video_stretch=False,
+        max_video_stretch=2.0,
         is_gui=False,
         progress=gr.Progress(),
     ):
@@ -639,6 +648,21 @@ class SoniTranslate(SoniTrCache):
         mix_audio_file = "audio_mix.mp3"
         vid_subs = "video_subs_file.mp4"
         video_output_file = "video_dub.mp4"
+        stretched_video_file = "video_stretched.mp4"
+        stretched_bg_audio_file = "audio_bg_stretched.wav"
+
+        # Stretch-the-video mode (frame-accurate): only for video outputs
+        use_video_stretch = bool(
+            video_stretch
+            and not is_audio_file(media_file)
+            and "audio" not in output_type
+        )
+        max_video_stretch = float(max_video_stretch or 2.0)
+        if use_video_stretch:
+            logger.info(
+                f"Video stretch mode ON (max slow-down {max_video_stretch}x)"
+            )
+        self.stretch_tmap = None
 
         if os.path.exists(media_file):
             media_base_hash = get_hash(media_file)
@@ -1024,15 +1048,64 @@ class SoniTranslate(SoniTrCache):
             custom_voices,
             custom_voices_workers,
             copy.deepcopy(self.vci.model_config),
-            avoid_overlap
+            avoid_overlap,
+            use_video_stretch,
+            max_video_stretch if use_video_stretch else 0
         ], {
             "valid_speakers": self.valid_speakers
         }):
+            stretch_speedups = None
+            if use_video_stretch:
+                import librosa
+
+                prog_disp(
+                    "Planning frame-accurate video stretch...",
+                    0.82,
+                    is_gui,
+                    progress=progress,
+                )
+                stretch_fps, stretch_video_duration = probe_video(
+                    base_video_file
+                )
+                stretch_segments = self.result_diarize["segments"]
+                def _tts_duration(path):
+                    try:
+                        return librosa.get_duration(filename=path)
+                    except TypeError:  # newer librosa renamed the kwarg
+                        return librosa.get_duration(path=path)
+
+                tts_durations = [
+                    _tts_duration(f"audio/{seg['start']}.ogg")
+                    for seg in stretch_segments
+                ]
+                self.stretch_tmap = build_pieces(
+                    stretch_segments,
+                    tts_durations,
+                    stretch_video_duration,
+                    stretch_fps,
+                    max_video_stretch=max_video_stretch,
+                )
+                seg_speedups = {
+                    piece["seg_index"]: piece["audio_speedup"]
+                    for piece in self.stretch_tmap.pieces
+                    if piece["kind"] == "seg"
+                }
+                stretch_speedups = [
+                    seg_speedups.get(i, 1.0)
+                    for i in range(len(stretch_segments))
+                ]
+                logger.info(
+                    "Video stretch: "
+                    f"{stretch_video_duration:.2f}s -> "
+                    f"{self.stretch_tmap.total_seconds:.2f}s"
+                )
+
             audio_files, speakers_list = accelerate_segments(
                     self.result_diarize,
                     max_accelerate_audio,
                     self.valid_speakers,
                     acceleration_rate_regulation,
+                    stretch_speedups=stretch_speedups,
                 )
 
             # Voice Imitation (Tone color converter)
@@ -1080,12 +1153,35 @@ class SoniTranslate(SoniTrCache):
                 progress=progress,
             )
             remove_files(dub_audio_file)
+            dub_segments = self.result_diarize
+            dub_avoid_overlap = avoid_overlap
+            if use_video_stretch and self.stretch_tmap:
+                orig_segments = self.result_diarize["segments"]
+                new_starts = self.stretch_tmap.segment_new_starts(
+                    len(orig_segments), orig_segments
+                )
+                dub_segments = {
+                    "segments": [
+                        {
+                            "start": new_starts[i],
+                            "end": new_starts[i] + 0.001,
+                            "speaker": seg["speaker"],
+                        }
+                        for i, seg in enumerate(orig_segments)
+                    ]
+                }
+                # total length of the dub track = length of the new video
+                dub_segments["segments"][-1]["end"] = max(
+                    dub_segments["segments"][-1]["end"],
+                    self.stretch_tmap.total_seconds,
+                )
+                dub_avoid_overlap = False
             create_translated_audio(
-                self.result_diarize,
+                dub_segments,
                 audio_files,
                 dub_audio_file,
                 False,
-                avoid_overlap,
+                dub_avoid_overlap,
             )
 
         # Voiceless track, change with file
@@ -1116,12 +1212,31 @@ class SoniTranslate(SoniTrCache):
             mix_method_audio,
             volume_original_audio,
             volume_translated_audio,
-            voiceless_track
-        ], {}):
+            voiceless_track,
+            use_video_stretch,
+            max_video_stretch if use_video_stretch else 0
+        ], {"stretch_tmap": self.stretch_tmap}):
+            # Original/background audio follows the stretched video
+            mix_base_audio = base_audio_wav
+            if use_video_stretch and self.stretch_tmap:
+                prog_disp(
+                    "Retiming the original audio...",
+                    0.96,
+                    is_gui,
+                    progress=progress,
+                )
+                remove_files(stretched_bg_audio_file)
+                render_background_audio(
+                    base_audio_wav,
+                    stretched_bg_audio_file,
+                    self.stretch_tmap,
+                )
+                mix_base_audio = stretched_bg_audio_file
+
             # TYPE MIX AUDIO
             remove_files(mix_audio_file)
-            command_volume_mix = f'ffmpeg -y -i {base_audio_wav} -i {dub_audio_file} -filter_complex "[0:0]volume={volume_original_audio}[a];[1:0]volume={volume_translated_audio}[b];[a][b]amix=inputs=2:duration=longest" -c:a libmp3lame {mix_audio_file}'
-            command_background_mix = f'ffmpeg -i {base_audio_wav} -i {dub_audio_file} -filter_complex "[1:a]asplit=2[sc][mix];[0:a][sc]sidechaincompress=threshold=0.003:ratio=20[bg]; [bg][mix]amerge[final]" -map [final] {mix_audio_file}'
+            command_volume_mix = f'ffmpeg -y -i {mix_base_audio} -i {dub_audio_file} -filter_complex "[0:0]volume={volume_original_audio}[a];[1:0]volume={volume_translated_audio}[b];[a][b]amix=inputs=2:duration=longest" -c:a libmp3lame {mix_audio_file}'
+            command_background_mix = f'ffmpeg -i {mix_base_audio} -i {dub_audio_file} -filter_complex "[1:a]asplit=2[sc][mix];[0:a][sc]sidechaincompress=threshold=0.003:ratio=20[bg]; [bg][mix]amerge[final]" -map [final] {mix_audio_file}'
             if mix_method_audio == "Adjusting volumes and mixing audio":
                 # volume mix
                 run_command(command_volume_mix)
@@ -1172,12 +1287,43 @@ class SoniTranslate(SoniTrCache):
         if not self.task_in_cache("output", [
             hash_base_video_file,
             hash_base_audio_wav,
-            burn_subtitles_to_video
+            burn_subtitles_to_video,
+            use_video_stretch,
+            max_video_stretch if use_video_stretch else 0
         ], {}):
-            # Merge new audio + video
             remove_files(video_output_file)
-            run_command(
-                f"ffmpeg -i {base_video_file} -i {mix_audio_file} -c:v copy -c:a copy -map 0:v -map 1:a -shortest {video_output_file}"
+            if use_video_stretch and self.stretch_tmap:
+                prog_disp(
+                    "Stretching the video (frame-accurate)...",
+                    0.97,
+                    is_gui,
+                    progress=progress,
+                )
+                remove_files(stretched_video_file)
+                render_video(
+                    base_video_file,
+                    stretched_video_file,
+                    self.stretch_tmap,
+                )
+                # exact same length as the audio: no -shortest (it could
+                # cut the last frame if the mp3 is a few ms shorter)
+                run_command(
+                    f"ffmpeg -i {stretched_video_file} -i {mix_audio_file} -c:v copy -c:a copy -map 0:v -map 1:a {video_output_file}"
+                )
+            else:
+                # Merge new audio + video
+                run_command(
+                    f"ffmpeg -i {base_video_file} -i {mix_audio_file} -c:v copy -c:a copy -map 0:v -map 1:a -shortest {video_output_file}"
+                )
+
+        stretched_subs_dir = ""
+        if use_video_stretch and self.stretch_tmap:
+            # subtitles must follow the new timeline too
+            stretched_subs_dir = remap_subtitle_set(
+                self.stretch_tmap,
+                output_format_subtitle
+                if output_format_subtitle != "disable"
+                else "srt",
             )
 
         output = media_out(
@@ -1188,6 +1334,7 @@ class SoniTranslate(SoniTrCache):
             file_obj=video_output_file,
             soft_subtitles=soft_subtitles_to_video,
             subtitle_files=output_format_subtitle,
+            subs_dir=stretched_subs_dir,
         )
         msg_out = output[0] if isinstance(output, list) else output
         logger.info(f"Done: {msg_out}")
@@ -1814,6 +1961,21 @@ def create_gui(theme, logs_in_gui=False):
                                 False,
                                 label=lg_conf["or_label"],
                                 info=lg_conf["or_info"],
+                            )
+                            video_stretch_gui = gr.Checkbox(
+                                False,
+                                label="Stretch video to fit the dub (frame-accurate)",
+                                info="Slows down the video of each segment instead of speeding up the speech. Original audio, subtitles and dub stay in sync.",
+                            )
+                            max_video_stretch_gui = gr.Slider(
+                                label="Max video slow-down",
+                                value=2.0,
+                                step=0.1,
+                                minimum=1.0,
+                                maximum=3.0,
+                                visible=True,
+                                interactive=True,
+                                info="If a segment needs more than this, the leftover is applied to the speech speed.",
                             )
 
                             gr.HTML("<hr></h2>")
@@ -2714,6 +2876,8 @@ def create_gui(theme, logs_in_gui=False):
                 enable_cache_gui,
                 enable_custom_voice,
                 workers_custom_voice,
+                video_stretch_gui,
+                max_video_stretch_gui,
                 is_gui_dummy_check,
             ],
             outputs=subs_edit_space,
@@ -2781,6 +2945,8 @@ def create_gui(theme, logs_in_gui=False):
                 enable_cache_gui,
                 enable_custom_voice,
                 workers_custom_voice,
+                video_stretch_gui,
+                max_video_stretch_gui,
                 is_gui_dummy_check,
             ],
             outputs=video_output,
