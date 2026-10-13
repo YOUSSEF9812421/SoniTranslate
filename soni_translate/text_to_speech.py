@@ -1605,7 +1605,12 @@ def accelerate_segments(
     valid_speakers,
     acceleration_rate_regulation=False,
     folder_output="audio2",
+    stretch_speedups=None,
 ):
+    # stretch_speedups: optional per-segment exact atempo factors (>= 1.0)
+    # used by the "stretch video" mode: the video was slowed down to fit the
+    # dub, so only the leftover (if any) is applied to the speech and the
+    # usual clamps/rounding below are skipped.
     logger.info("Apply acceleration")
 
     (
@@ -1683,6 +1688,9 @@ def accelerate_segments(
         # Round
         acc_percentage = round(acc_percentage + 0.0, 1)
 
+        if stretch_speedups is not None:
+            acc_percentage = max(1.0, float(stretch_speedups[i]))
+
         # Format read if need
         if speaker in speakers_edge:
             info_enc = sf.info(filename).format
@@ -1693,8 +1701,17 @@ def accelerate_segments(
         if acc_percentage == 1.0 and info_enc == "OGG":
             copy_files(filename, f"{folder_output}{os.sep}audio")
         else:
+            tempo_chain = f"atempo={acc_percentage}"
+            if stretch_speedups is not None:
+                # chain atempo (older ffmpeg builds only accept <= 2.0)
+                factors, remaining = [], acc_percentage
+                while remaining > 2.0:
+                    factors.append(2.0)
+                    remaining /= 2.0
+                factors.append(remaining)
+                tempo_chain = ",".join(f"atempo={f:.8f}" for f in factors)
             os.system(
-                f"ffmpeg -y -loglevel panic -i {filename} -filter:a atempo={acc_percentage} {folder_output}/{filename}"
+                f"ffmpeg -y -loglevel panic -i {filename} -filter:a {tempo_chain} {folder_output}/{filename}"
             )
 
         if logger.isEnabledFor(logging.DEBUG):
