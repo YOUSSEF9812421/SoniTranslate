@@ -238,6 +238,7 @@ def determine_chunk_size(file_name):
         re.compile(r".* OpenAI-TTS$"): 1024,  # max charaters 4096
         re.compile(r".* JOE$"): 1024,  # Gemini TTS
         re.compile(r".* NAMAA-TTS$"): 400,  # NAMAA Egyptian TTS
+        re.compile(r".* CBX-TTS$"): 250,  # Chatterbox Multilingual
     }
 
     for pattern, chunk_size in patterns.items():

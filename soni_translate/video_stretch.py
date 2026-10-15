@@ -200,54 +200,230 @@ def _fps_str(fps):
     return f"{fps.numerator}/{fps.denominator}"
 
 
-def render_video(video_in, video_out, tmap, crf=18, preset="medium"):
+def _render_plan(tmap):
     """
-    Render every piece with an exact frame count, then concat.
-    Source frames [src_start, src_end) -> exactly new_frames output frames.
+    Pieces to actually render. Neighbouring pieces that are NOT stretched
+    (factor 1.0) and are contiguous in the source are merged into one, so
+    there are fewer ffmpeg runs and fewer cuts. The time map is untouched.
     """
+    plan = []
+    for p in tmap.pieces:
+        s0, e0, k0 = p["src_start"], p["src_end"], p["new_frames"]
+        last = plan[-1] if plan else None
+        if (
+            last
+            and k0 == e0 - s0
+            and last["new_frames"] == last["src_end"] - last["src_start"]
+            and last["src_end"] == s0
+        ):
+            last["src_end"] = e0
+            last["new_frames"] += k0
+        else:
+            plan.append(
+                {"src_start": s0, "src_end": e0, "new_frames": k0}
+            )
+    return plan
+
+
+def _probe_size(path):
+    out = _run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height", "-of", "csv=p=0", path,
+    ])
+    width, height = out.strip().split(",")[:2]
+    return int(width), int(height)
+
+
+def _count_packets(path):
+    out = _run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-count_packets", "-show_entries", "stream=nb_read_packets",
+        "-of", "csv=p=0", path,
+    ])
+    return int(out.strip().split(",")[0])
+
+
+_NVENC_STATE = {}
+
+
+def nvenc_args():
+    """
+    Arguments for h264_nvenc that really work on this machine, or None.
+    Probed once with a tiny real encode: ffmpeg may list h264_nvenc and still
+    fail (no GPU, or the container doesn't expose libnvidia-encode, which is
+    common on Kaggle).
+    """
+    if "args" in _NVENC_STATE:
+        return _NVENC_STATE["args"]
+    found = None
+    for extra in (
+        ["-preset", "p4", "-tune", "hq"],
+        ["-preset", "medium"],
+    ):
+        try:
+            _run([
+                "ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                "color=c=black:s=320x240:r=25:d=0.4", "-frames:v", "8",
+                "-c:v", "h264_nvenc", *extra, "-pix_fmt", "yuv420p",
+                "-f", "null", "-",
+            ])
+            found = extra
+            break
+        except Exception:
+            continue
+    _NVENC_STATE["args"] = found
+    return found
+
+
+def pick_encoder():
+    """'nvenc' (GPU) when it works, else 'x264' (CPU).
+    SONITR_STRETCH_ENCODER = auto (default) | nvenc | x264"""
+    mode = os.environ.get("SONITR_STRETCH_ENCODER", "auto").lower()
+    if mode in ("x264", "cpu", "libx264"):
+        return "x264"
+    if nvenc_args() is not None:
+        return "nvenc"
+    if mode == "nvenc":
+        logger.warning(
+            "NVENC was requested but it does not work on this machine; "
+            "using the CPU encoder (libx264)."
+        )
+    return "x264"
+
+
+def _render_clip(video_in, clip, piece, fps, width, height, timescale,
+                 encoder, crf, preset, threads):
+    src_frames = piece["src_end"] - piece["src_start"]
+    new_frames = piece["new_frames"]
+    factor = new_frames / src_frames
+    filters = [
+        f"trim=start_frame=0:end_frame={src_frames}",
+        f"setpts=(PTS-STARTPTS)*{factor:.12f}",
+    ]
+    if width % 2 or height % 2:  # yuv420p needs even sizes
+        filters.append("crop=trunc(iw/2)*2:trunc(ih/2)*2")
+    filters += [
+        f"fps={_fps_str(fps)}:round=down",
+        # ffmpeg's fps filter can end 1-2 frames short on stretched clips
+        # (the last frame's duration isn't scaled): clone the last frame,
+        # -frames:v then cuts at the exact planned count.
+        "tpad=stop_mode=clone:stop=-1",
+    ]
+    cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+    if os.environ.get("SONITR_STRETCH_HWDEC") == "1":
+        cmd += ["-hwaccel", "cuda"]  # experimental, off by default
+    if piece["src_start"] > 0:
+        # seek half a frame early: the first kept frame is exactly source
+        # frame `src_start` whatever the container rounding
+        cmd += ["-ss", f"{(piece['src_start'] - 0.5) / float(fps):.6f}"]
+    cmd += ["-i", video_in, "-an", "-vf", ",".join(filters),
+            "-frames:v", str(new_frames)]
+    if encoder == "nvenc":
+        # no B-frames: keeps timestamps simple for the stream-copy concat
+        cmd += ["-c:v", "h264_nvenc", *nvenc_args(), "-rc", "vbr",
+                "-cq", str(crf + 2), "-b:v", "0", "-bf", "0"]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+                "-threads", str(threads)]
+    cmd += ["-pix_fmt", "yuv420p", "-r", _fps_str(fps),
+            "-video_track_timescale", str(timescale), clip]
+    _run(cmd)
+
+
+def _render_video_with(encoder, video_in, video_out, tmap, crf, preset,
+                       workers):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     fps = tmap.fps
     work = VIDEO_PIECES_DIR
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work, exist_ok=True)
+    try:
+        width, height = _probe_size(video_in)
+        plan = _render_plan(tmap)
+        # integer ticks per frame -> no sub-tick drift on concatenation
+        timescale = fps.numerator * max(1, -(-90000 // fps.numerator))
+        cpus = os.cpu_count() or 1
+        if workers is None:
+            workers = min(3, cpus) if encoder == "nvenc" else min(4, cpus)
+        workers = max(1, workers)
+        threads = max(1, cpus // workers)
+        logger.info(
+            f"Video stretch: {len(plan)} clips, encoder={encoder}, "
+            f"{workers} parallel job(s)"
+        )
 
-    list_path = os.path.join(work, "list.txt")
-    # integer ticks per frame -> no sub-tick drift when clips are concatenated
-    timescale = fps.numerator * max(1, -(-90000 // fps.numerator))
-    with open(list_path, "w") as list_file:
-        for n, p in enumerate(tmap.pieces):
-            clip = os.path.join(work, f"v_{n:05d}.mp4")
-            src_frames = p["src_end"] - p["src_start"]
-            new_frames = p["new_frames"]
-            factor = new_frames / src_frames
-            vf = (
-                f"trim=start_frame=0:end_frame={src_frames},"
-                f"setpts=(PTS-STARTPTS)*{factor:.12f},"
-                f"fps={_fps_str(fps)}:round=down,"
-                # ffmpeg's fps filter can end 1-2 frames short on stretched
-                # clips (last frame's duration isn't scaled): clone the last
-                # frame, -frames:v then cuts at the exact planned count.
-                f"tpad=stop_mode=clone:stop=-1"
-            )
-            cmd = ["ffmpeg", "-y", "-loglevel", "error"]
-            if p["src_start"] > 0:
-                # seek half a frame early: the first kept frame is exactly
-                # source frame `src_start` whatever the container rounding
-                cmd += ["-ss", f"{(p['src_start'] - 0.5) / float(fps):.6f}"]
-            cmd += [
-                "-i", video_in, "-an", "-vf", vf,
-                "-frames:v", str(new_frames),
-                "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
-                "-pix_fmt", "yuv420p", "-r", _fps_str(fps),
-                "-video_track_timescale", str(timescale), clip,
-            ]
-            _run(cmd)
-            list_file.write(f"file '{os.path.abspath(clip)}'\n")
+        clips = [os.path.join(work, f"v_{n:05d}.mp4")
+                 for n in range(len(plan))]
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _render_clip, video_in, clips[n], piece, fps, width,
+                    height, timescale, encoder, crf, preset, threads,
+                ): n
+                for n, piece in enumerate(plan)
+            }
+            done = 0
+            try:
+                for future in as_completed(futures):
+                    future.result()
+                    done += 1
+                    if done % 10 == 0 or done == len(plan):
+                        logger.info(f"Video stretch: {done}/{len(plan)}")
+            except BaseException:
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
 
-    _run([
-        "ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
-        "-i", list_path, "-c", "copy", video_out,
-    ])
-    shutil.rmtree(work, ignore_errors=True)
+        list_path = os.path.join(work, "list.txt")
+        with open(list_path, "w") as list_file:
+            for clip in clips:
+                list_file.write(f"file '{os.path.abspath(clip)}'\n")
+        _run([
+            "ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe",
+            "0", "-i", list_path, "-c", "copy", video_out,
+        ])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    got = _count_packets(video_out)
+    if got != tmap.total_frames:
+        raise RuntimeError(
+            f"frame count mismatch ({got} instead of {tmap.total_frames})"
+        )
+
+
+def render_video(video_in, video_out, tmap, crf=None, preset=None,
+                 encoder=None, workers=None):
+    """
+    Render every piece with an exact frame count, then concat.
+    Source frames [src_start, src_end) -> exactly new_frames output frames.
+
+    Uses the GPU encoder (NVENC) when it works, otherwise libx264. The
+    result is always checked against the planned frame count; if the GPU
+    result is off it is rendered again on the CPU, so a wrong video is never
+    returned. Environment: SONITR_STRETCH_ENCODER (auto|nvenc|x264),
+    SONITR_STRETCH_PRESET (x264 preset, default veryfast),
+    SONITR_STRETCH_CRF (default 17), SONITR_STRETCH_HWDEC=1 (GPU decode,
+    experimental).
+    """
+    crf = int(crf if crf is not None else
+              os.environ.get("SONITR_STRETCH_CRF", 17))
+    preset = preset or os.environ.get("SONITR_STRETCH_PRESET", "veryfast")
+    encoder = encoder or pick_encoder()
+    try:
+        _render_video_with(
+            encoder, video_in, video_out, tmap, crf, preset, workers
+        )
+    except Exception as error:
+        if encoder != "nvenc":
+            raise
+        logger.warning(
+            f"GPU encoding failed ({str(error)[-300:]}); "
+            "rendering again on the CPU."
+        )
+        _render_video_with(
+            "x264", video_in, video_out, tmap, crf, preset, workers
+        )
     return video_out
 
 
@@ -264,7 +440,7 @@ def render_background_audio(audio_in, audio_out, tmap, sample_rate=44100):
     list_path = os.path.join(work, "list.txt")
 
     with open(list_path, "w") as list_file:
-        for n, p in enumerate(tmap.pieces):
+        for n, p in enumerate(_render_plan(tmap)):
             clip = os.path.join(work, f"a_{n:05d}.wav")
             t0 = p["src_start"] / fps
             t1 = p["src_end"] / fps

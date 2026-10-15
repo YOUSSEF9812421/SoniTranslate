@@ -1437,6 +1437,352 @@ def segments_namaa_tts(filtered_namaa_segments, TRANSLATE_AUDIO_TO):
 
 
 # =====================================
+# CHATTERBOX MULTILINGUAL TTS (voice cloning, GPU)
+# Model: ResembleAI/chatterbox (MIT license, 23 languages).
+# Runs in the SAME separate Python environment as NAMAA (`cb_env`), as a
+# separate process that executes soni_translate/chatterbox_worker.py.
+#
+# Reference voices: put audio files (wav/mp3/ogg/m4a/flac, 10-30 s of clean
+# speech, no music) in the folder `chatterbox_voices/`. Every file shows up in
+# the TTS selector as ">name (Chatterbox) CBX-TTS". Tip: name the file
+# `name.ar.wav` to tell which language it was recorded in; when it differs from
+# the target language the cfg_weight is set to 0 (recommended by the authors
+# to avoid carrying the accent over).
+# Optional environment variables:
+#   SONITR_CHATTERBOX_PYTHON       python of the environment (default: cb_env)
+#   SONITR_CHATTERBOX_CFG          force cfg_weight (default 0.5 / 0 if the
+#                                  reference language differs)
+#   SONITR_CHATTERBOX_EXAGGERATION default 0.5
+#   SONITR_CHATTERBOX_ALLOW_CPU=1  allow CPU if there is no GPU (very slow)
+# =====================================
+CHATTERBOX_WORKER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "chatterbox_worker.py"
+)
+CHATTERBOX_VOICES_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "chatterbox_voices",
+)
+CHATTERBOX_SUFFIX = " CBX-TTS"
+CHATTERBOX_DEFAULT_LABEL = ">Default voice (Chatterbox) CBX-TTS"
+CHATTERBOX_LANGUAGES = {
+    "ar", "da", "de", "el", "en", "es", "fi", "fr", "he", "hi", "it", "ja",
+    "ko", "ms", "nl", "no", "pl", "pt", "ru", "sv", "sw", "tr", "zh",
+}
+CHATTERBOX_AUDIO_EXT = (".wav", ".mp3", ".ogg", ".m4a", ".flac")
+CHATTERBOX_SETUP_HELP = (
+    "Chatterbox needs the separate Python environment (the same one used by "
+    "NAMAA). Run the setup cell in the notebook:\n"
+    "  !uv venv /kaggle/working/cb_env --python 3.11\n"
+    "  !uv pip install --python /kaggle/working/cb_env/bin/python "
+    "chatterbox-tts \"setuptools<82\"\n"
+    "Or set SONITR_CHATTERBOX_PYTHON to the python of that environment. "
+    "Otherwise choose another TTS voice."
+)
+
+
+def chatterbox_language(language):
+    """Chatterbox language_id for a SoniTranslate language code, or None."""
+    code = str(language or "").strip().lower().replace("_", "-")
+    code = {"nb": "no", "nn": "no", "iw": "he"}.get(code, code)
+    if code in CHATTERBOX_LANGUAGES:
+        return code
+    short = code.split("-")[0]
+    short = {"nb": "no", "nn": "no", "iw": "he"}.get(short, short)
+    return short if short in CHATTERBOX_LANGUAGES else None
+
+
+def _parse_chatterbox_file(filename):
+    """'youssef.ar.wav' -> ('youssef', 'ar'); 'youssef.wav' -> ('youssef', None)"""
+    stem, _ext = os.path.splitext(filename)
+    name, dot, tag = stem.rpartition(".")
+    if dot and name and tag.lower() in CHATTERBOX_LANGUAGES:
+        return name, tag.lower()
+    return stem, None
+
+
+def _chatterbox_label(name):
+    return f">{name} (Chatterbox){CHATTERBOX_SUFFIX}"
+
+
+def chatterbox_voices_list():
+    """TTS selector entries: the default voice + one per reference file."""
+    os.makedirs(CHATTERBOX_VOICES_DIR, exist_ok=True)
+    labels = [CHATTERBOX_DEFAULT_LABEL]
+    for filename in sorted(os.listdir(CHATTERBOX_VOICES_DIR)):
+        if filename.lower().endswith(CHATTERBOX_AUDIO_EXT):
+            label = _chatterbox_label(_parse_chatterbox_file(filename)[0])
+            if label not in labels:
+                labels.append(label)
+    return labels
+
+
+def chatterbox_reference_for(label):
+    """(path | None, recorded-language | None) of a selector entry."""
+    if label == CHATTERBOX_DEFAULT_LABEL:
+        return None, None
+    if os.path.isdir(CHATTERBOX_VOICES_DIR):
+        for filename in sorted(os.listdir(CHATTERBOX_VOICES_DIR)):
+            if not filename.lower().endswith(CHATTERBOX_AUDIO_EXT):
+                continue
+            name, lang = _parse_chatterbox_file(filename)
+            if _chatterbox_label(name) == label:
+                return os.path.join(CHATTERBOX_VOICES_DIR, filename), lang
+    raise TTS_OperationError(
+        f"Chatterbox reference voice not found for '{label}'. Put the "
+        f"audio file in the folder: {CHATTERBOX_VOICES_DIR}"
+    )
+
+
+def find_chatterbox_python():
+    custom = os.environ.get("SONITR_CHATTERBOX_PYTHON")
+    if custom:
+        valid = os.path.isfile(custom) and os.access(custom, os.X_OK)
+        return custom if valid else None
+    return find_namaa_python()  # the same cb_env
+
+
+def check_chatterbox_environment(voices=(), target_language=None):
+    """Raise a clear error (before any long processing) if Chatterbox can't
+    run: missing environment/worker, unknown reference file, or a target
+    language the model doesn't speak."""
+    python_path = find_chatterbox_python()
+    if python_path is None:
+        raise TTS_OperationError(
+            "Chatterbox environment not found. " + CHATTERBOX_SETUP_HELP
+        )
+    if not os.path.isfile(CHATTERBOX_WORKER):
+        raise TTS_OperationError(
+            f"Chatterbox worker file is missing: {CHATTERBOX_WORKER}. "
+            "Upload soni_translate/chatterbox_worker.py to the project."
+        )
+    for voice in voices:
+        if isinstance(voice, str) and voice.endswith(CHATTERBOX_SUFFIX):
+            chatterbox_reference_for(voice)
+    if target_language is not None and chatterbox_language(
+        target_language
+    ) is None:
+        raise TTS_OperationError(
+            f"Chatterbox does not support the target language "
+            f"'{target_language}'. Supported: "
+            f"{', '.join(sorted(CHATTERBOX_LANGUAGES))}"
+        )
+    return python_path
+
+
+def prepare_chatterbox_reference(source, out_wav):
+    """Mono 24 kHz wav, leading silence removed, first 15 s. Returns the
+    duration in seconds."""
+    import shutil as _shutil
+
+    if _shutil.which("ffmpeg") is None:
+        raise TTS_OperationError("ffmpeg is needed to prepare the voice")
+    command = [
+        "ffmpeg", "-y", "-loglevel", "error", "-i", source, "-vn",
+        "-af",
+        "silenceremove=start_periods=1:start_duration=0.05"
+        ":start_threshold=-45dB:detection=peak",
+        "-ac", "1", "-ar", "24000", "-t", "15", out_wav,
+    ]
+    result = subprocess.run(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    if result.returncode != 0 or not os.path.exists(out_wav):
+        raise TTS_OperationError(
+            f"Could not read the reference voice {source}: "
+            + result.stderr.decode(errors="ignore")[-300:]
+        )
+    duration = sf.info(out_wav).duration
+    if duration < 1.5:
+        raise TTS_OperationError(
+            f"The reference voice {os.path.basename(source)} is too short "
+            f"({duration:.1f}s). Use 10-30 seconds of clean speech."
+        )
+    if duration < 5:
+        logger.warning(
+            f"Reference voice {os.path.basename(source)} is only "
+            f"{duration:.1f}s; 10-30 s of clean speech clones much better."
+        )
+    return duration
+
+
+def segments_chatterbox_tts(filtered_chatterbox_segments, TRANSLATE_AUDIO_TO):
+    import gc
+    import json
+    import shutil
+    import tempfile
+    from collections import deque
+
+    language = chatterbox_language(TRANSLATE_AUDIO_TO)
+    segments = filtered_chatterbox_segments["segments"]
+    voices = {segment.get("tts_name", "") for segment in segments}
+    python_path = check_chatterbox_environment(voices, TRANSLATE_AUDIO_TO)
+
+    # free what this process still holds on the GPU for the worker
+    gc.collect()
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    exaggeration = float(
+        os.environ.get("SONITR_CHATTERBOX_EXAGGERATION", "0.5")
+    )
+    forced_cfg = os.environ.get("SONITR_CHATTERBOX_CFG")
+
+    tmp_dir = tempfile.mkdtemp(prefix="chatterbox_tts_")
+    references = {}  # label -> (prepared wav | None, cfg_weight)
+    for label in voices:
+        source, ref_language = chatterbox_reference_for(label)
+        if source is None:
+            references[label] = (None, 0.5)
+            continue
+        prepared = os.path.join(tmp_dir, f"ref_{len(references)}.wav")
+        duration = prepare_chatterbox_reference(source, prepared)
+        if forced_cfg is not None:
+            cfg_weight = float(forced_cfg)
+        elif ref_language and ref_language != language:
+            cfg_weight = 0.0  # different language: avoid the accent transfer
+        else:
+            cfg_weight = 0.5
+        logger.info(
+            f"Chatterbox voice '{label}': {os.path.basename(source)} "
+            f"({duration:.0f}s), cfg_weight={cfg_weight}"
+        )
+        references[label] = (prepared, cfg_weight)
+
+    items = []
+    for index, segment in enumerate(segments):
+        text = str(segment.get("text", "")).strip()
+        prepared, cfg_weight = references[segment.get("tts_name", "")]
+        items.append({
+            "id": index,
+            "text": text,
+            "out": os.path.join(tmp_dir, f"{index}.wav"),
+            "ref": prepared,
+            "cfg_weight": cfg_weight,
+            "exaggeration": exaggeration,
+        })
+    to_generate = [item for item in items if item["text"]]
+
+    process = None
+    try:
+        fatal_message = None
+        tail = deque(maxlen=30)
+        code = 0
+        if to_generate:
+            jobs_path = os.path.join(tmp_dir, "jobs.json")
+            with open(jobs_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"device": "cuda", "language": language,
+                     "items": to_generate},
+                    f, ensure_ascii=False,
+                )
+
+            env = os.environ.copy()
+            env.pop("PYTHONPATH", None)
+            env.pop("PYTHONHOME", None)
+            env["PYTHONUNBUFFERED"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
+            logger.info(
+                f"Chatterbox TTS: {len(to_generate)} segments, language "
+                f"{language} (python: {python_path})"
+            )
+            process = subprocess.Popen(
+                [python_path, CHATTERBOX_WORKER, jobs_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                bufsize=1,
+            )
+            progress_bar = tqdm(
+                total=len(to_generate), desc="Chatterbox TTS"
+            )
+            for line in process.stdout:
+                line = line.strip()
+                if line.startswith("CBX_PROGRESS"):
+                    try:
+                        done = int(line.split()[1].split("/")[0])
+                        progress_bar.update(done - progress_bar.n)
+                    except (IndexError, ValueError):
+                        pass
+                elif line.startswith("CBX_STATUS"):
+                    logger.info(line)
+                elif line.startswith("CBX_ITEM_ERROR"):
+                    logger.warning(line)
+                elif line.startswith("CBX_FATAL"):
+                    fatal_message = line[len("CBX_FATAL"):].strip()
+                    logger.error(line)
+                elif line:
+                    tail.append(line[:300])
+            progress_bar.close()
+            code = process.wait()
+
+        produced = [os.path.exists(item["out"]) for item in items]
+        if to_generate and not any(produced):
+            raise TTS_OperationError(
+                "Chatterbox TTS produced no audio"
+                + (f": {fatal_message}" if fatal_message else
+                   f" (exit code {code})")
+                + ("\nLast output of the Chatterbox process:\n"
+                   + "\n".join(tail) if tail else "")
+            )
+        if code != 0:
+            logger.warning(
+                f"Chatterbox process ended with exit code {code}; segments "
+                "without audio will use the auxiliary TTS."
+            )
+
+        for segment, item in zip(segments, items):
+            start = segment["start"]
+            filename = f"audio/{start}.ogg"
+            logger.info(f"{item['text']} >> {filename}")
+            try:
+                if not item["text"]:
+                    duration = float(segment["end"]) - float(start)
+                    sample_rate = 24000
+                    audio = np.zeros(
+                        max(1, int(sample_rate * duration)), dtype=np.float32
+                    )
+                    write_chunked(
+                        file=filename, samplerate=sample_rate, data=audio,
+                        format="ogg", subtype="vorbis",
+                    )
+                else:
+                    if not os.path.exists(item["out"]):
+                        raise TTS_OperationError(
+                            "Chatterbox did not generate audio for this "
+                            "segment"
+                        )
+                    audio, sample_rate = sf.read(item["out"], dtype="float32")
+                    if audio.ndim > 1:
+                        audio = audio.mean(axis=1)
+                    data_tts = pad_array(audio, sample_rate)
+                    write_chunked(
+                        file=filename, samplerate=sample_rate,
+                        data=data_tts, format="ogg", subtype="vorbis",
+                    )
+                verify_saved_file_and_size(filename)
+            except Exception as error:
+                error_handling_in_tts(
+                    error, segment, TRANSLATE_AUDIO_TO, filename
+                )
+    finally:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# =====================================
 # Select task TTS
 # =====================================
 
@@ -1521,6 +1867,7 @@ def audio_segmentation_to_voice(
     pattern_openai_tts = re.compile(r".* OpenAI-TTS$")
     pattern_gemini_tts = re.compile(r".* JOE$")
     pattern_namaa_tts = re.compile(r".* NAMAA-TTS$")
+    pattern_chatterbox_tts = re.compile(r".* CBX-TTS$")
 
     all_segments = result_diarize["segments"]
 
@@ -1540,6 +1887,9 @@ def audio_segmentation_to_voice(
     speakers_namaa_tts = find_spkr(
         pattern_namaa_tts, speaker_to_voice, all_segments
     )
+    speakers_chatterbox_tts = find_spkr(
+        pattern_chatterbox_tts, speaker_to_voice, all_segments
+    )
 
     # Filter method in segments
     filtered_edge = filter_by_speaker(speakers_edge, all_segments)
@@ -1550,6 +1900,9 @@ def audio_segmentation_to_voice(
     filtered_openai_tts = filter_by_speaker(speakers_openai_tts, all_segments)
     filtered_gemini_tts = filter_by_speaker(speakers_gemini_tts, all_segments)
     filtered_namaa_tts = filter_by_speaker(speakers_namaa_tts, all_segments)
+    filtered_chatterbox_tts = filter_by_speaker(
+        speakers_chatterbox_tts, all_segments
+    )
 
     # Infer
     if filtered_edge["segments"]:
@@ -1585,6 +1938,11 @@ def audio_segmentation_to_voice(
     if filtered_namaa_tts["segments"]:
         logger.info(f"NAMAA TTS: {speakers_namaa_tts}")
         segments_namaa_tts(filtered_namaa_tts, TRANSLATE_AUDIO_TO)  # ogg
+    if filtered_chatterbox_tts["segments"]:
+        logger.info(f"Chatterbox TTS: {speakers_chatterbox_tts}")
+        segments_chatterbox_tts(
+            filtered_chatterbox_tts, TRANSLATE_AUDIO_TO
+        )  # ogg
 
     [result.pop("tts_name", None) for result in result_diarize["segments"]]
     return [
@@ -1595,7 +1953,8 @@ def audio_segmentation_to_voice(
         speakers_vits_onnx,
         speakers_openai_tts,
         speakers_gemini_tts,
-        speakers_namaa_tts
+        speakers_namaa_tts,
+        speakers_chatterbox_tts
     ]
 
 
