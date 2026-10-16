@@ -23,6 +23,8 @@ from soni_translate.text_to_speech import (
     create_wav_file_vc,
     accelerate_segments,
     check_namaa_environment,
+    check_chatterbox_environment,
+    chatterbox_voices_list,
 )
 from soni_translate.translate_segments import (
     translate_text,
@@ -132,6 +134,7 @@ class TTS_Info:
         self.list_openai_tts = OPENAI_TTS_MODELS
         self.list_gemini_tts = GEMINI_TTS_MODELS
         self.list_namaa_tts = NAMAA_TTS_MODELS
+        self.list_chatterbox_tts = chatterbox_voices_list()
         self.piper_enabled = piper_enabled
         self.list_vits_onnx = (
             piper_tts_voices_list() if self.piper_enabled else []
@@ -149,6 +152,7 @@ class TTS_Info:
             + self.list_openai_tts
             + self.list_gemini_tts
             + self.list_namaa_tts
+            + self.list_chatterbox_tts
             + self.list_vits_onnx
         )
         return list_tts
@@ -503,6 +507,25 @@ class SoniTranslate(SoniTrCache):
             ]
         ):
             check_namaa_environment()
+
+        if any(
+            isinstance(voice, str) and voice.endswith(" CBX-TTS")
+            for voice in [
+                tts_voice00, tts_voice01, tts_voice02, tts_voice03,
+                tts_voice04, tts_voice05, tts_voice06, tts_voice07,
+                tts_voice08, tts_voice09, tts_voice10, tts_voice11,
+            ]
+        ):
+            check_chatterbox_environment(
+                [
+                    tts_voice00, tts_voice01, tts_voice02, tts_voice03,
+                    tts_voice04, tts_voice05, tts_voice06, tts_voice07,
+                    tts_voice08, tts_voice09, tts_voice10, tts_voice11,
+                ],
+                LANGUAGES[origin_language]
+                if translate_process == "disable_translation"
+                else LANGUAGES[target_language],
+            )
 
         if media_file is None:
             media_file = (
@@ -1367,6 +1390,9 @@ class SoniTranslate(SoniTrCache):
         if isinstance(tts, str) and tts.endswith(" NAMAA-TTS"):
             check_namaa_environment()
 
+        if isinstance(tts, str) and tts.endswith(" CBX-TTS"):
+            check_chatterbox_environment([tts])
+
         prog_disp("Processing pages...", 0.10, is_gui, progress=progress)
         doc_data = doc_to_txtximg_pages(document,  width, height, start_page, end_page, bcolor)
         result_diarize = page_data_to_segments(doc_data, 1700)
@@ -1480,6 +1506,14 @@ class SoniTranslate(SoniTrCache):
 
         if isinstance(tts_voice00, str) and tts_voice00.endswith(" NAMAA-TTS"):
             check_namaa_environment()
+
+        if isinstance(tts_voice00, str) and tts_voice00.endswith(" CBX-TTS"):
+            check_chatterbox_environment(
+                [tts_voice00],
+                LANGUAGES[origin_language]
+                if translate_process == "disable_translation"
+                else LANGUAGES[target_language],
+            )
 
         SOURCE_LANGUAGE = LANGUAGES[origin_language]
         if translate_process != "disable_translation":

@@ -1450,6 +1450,7 @@ def segments_namaa_tts(filtered_namaa_segments, TRANSLATE_AUDIO_TO):
 # to avoid carrying the accent over).
 # Optional environment variables:
 #   SONITR_CHATTERBOX_PYTHON       python of the environment (default: cb_env)
+#   SONITR_CHATTERBOX_VOICES_DIR   folder of reference voices
 #   SONITR_CHATTERBOX_CFG          force cfg_weight (default 0.5 / 0 if the
 #                                  reference language differs)
 #   SONITR_CHATTERBOX_EXAGGERATION default 0.5
@@ -1458,9 +1459,11 @@ def segments_namaa_tts(filtered_namaa_segments, TRANSLATE_AUDIO_TO):
 CHATTERBOX_WORKER = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "chatterbox_worker.py"
 )
-CHATTERBOX_VOICES_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "chatterbox_voices",
+CHATTERBOX_VOICES_DIR = os.environ.get("SONITR_CHATTERBOX_VOICES_DIR") or (
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "chatterbox_voices",
+    )
 )
 CHATTERBOX_SUFFIX = " CBX-TTS"
 CHATTERBOX_DEFAULT_LABEL = ">Default voice (Chatterbox) CBX-TTS"

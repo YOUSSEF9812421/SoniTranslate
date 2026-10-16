@@ -275,6 +275,25 @@ def nvenc_args():
     return found
 
 
+def gpu_count():
+    """Number of NVIDIA GPUs (SONITR_STRETCH_GPUS overrides), at least 1."""
+    if "gpus" in _NVENC_STATE:
+        return _NVENC_STATE["gpus"]
+    count = 1
+    forced = os.environ.get("SONITR_STRETCH_GPUS")
+    try:
+        if forced:
+            count = max(1, int(forced))
+        else:
+            out = _run(["nvidia-smi", "-L"])
+            count = max(1, sum(1 for l in out.splitlines()
+                               if l.strip().startswith("GPU ")))
+    except Exception:
+        count = 1
+    _NVENC_STATE["gpus"] = count
+    return count
+
+
 def pick_encoder():
     """'nvenc' (GPU) when it works, else 'x264' (CPU).
     SONITR_STRETCH_ENCODER = auto (default) | nvenc | x264"""
@@ -292,7 +311,7 @@ def pick_encoder():
 
 
 def _render_clip(video_in, clip, piece, fps, width, height, timescale,
-                 encoder, crf, preset, threads):
+                 encoder, crf, preset, threads, index=0):
     src_frames = piece["src_end"] - piece["src_start"]
     new_frames = piece["new_frames"]
     factor = new_frames / src_frames
@@ -322,6 +341,8 @@ def _render_clip(video_in, clip, piece, fps, width, height, timescale,
         # no B-frames: keeps timestamps simple for the stream-copy concat
         cmd += ["-c:v", "h264_nvenc", *nvenc_args(), "-rc", "vbr",
                 "-cq", str(crf + 2), "-b:v", "0", "-bf", "0"]
+        if gpu_count() > 1:  # clips alternate between the GPUs
+            cmd += ["-gpu", str(index % gpu_count())]
     else:
         cmd += ["-c:v", "libx264", "-preset", preset, "-crf", str(crf),
                 "-threads", str(threads)]
@@ -345,7 +366,8 @@ def _render_video_with(encoder, video_in, video_out, tmap, crf, preset,
         timescale = fps.numerator * max(1, -(-90000 // fps.numerator))
         cpus = os.cpu_count() or 1
         if workers is None:
-            workers = min(3, cpus) if encoder == "nvenc" else min(4, cpus)
+            workers = (min(cpus, 3 * gpu_count()) if encoder == "nvenc"
+                       else min(4, cpus))
         workers = max(1, workers)
         threads = max(1, cpus // workers)
         logger.info(
@@ -359,7 +381,7 @@ def _render_video_with(encoder, video_in, video_out, tmap, crf, preset,
             futures = {
                 pool.submit(
                     _render_clip, video_in, clips[n], piece, fps, width,
-                    height, timescale, encoder, crf, preset, threads,
+                    height, timescale, encoder, crf, preset, threads, n,
                 ): n
                 for n, piece in enumerate(plan)
             }
