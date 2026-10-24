@@ -15,6 +15,12 @@ from soni_translate.video_stretch import (
     render_background_audio,
     remap_subtitle_set,
 )
+from soni_translate.dub_quality import (
+    filter_asr_hallucinations,
+    merge_short_segments,
+    clean_translated_segments,
+    quality_signature,
+)
 from soni_translate.text_to_speech import (
     audio_segmentation_to_voice,
     edge_tts_voices_list,
@@ -413,7 +419,7 @@ class SoniTranslate(SoniTrCache):
         YOUR_HF_TOKEN="",
         preview=False,
         transcriber_model="large-v3",
-        batch_size=4,
+        batch_size=16,
         compute_type="auto",
         origin_language="Automatic detection",
         target_language="English (en)",
@@ -769,6 +775,7 @@ class SoniTranslate(SoniTrCache):
                 batch_size,
                 literalize_numbers,
                 segment_duration_limit,
+                quality_signature("asr"),
                 (
                     "l_unit"
                     if text_segmentation_scale in ["word", "character"]
@@ -831,6 +838,12 @@ class SoniTranslate(SoniTrCache):
                     except Exception as error:
                         logger.error(str(error))
 
+                if not subtitle_file:
+                    # drop what Whisper invents on silence / music
+                    self.result = filter_asr_hallucinations(
+                        self.result, self.align_language
+                    )
+
             if self.result["segments"] == []:
                 raise ValueError("No active speech found in audio")
 
@@ -862,7 +875,8 @@ class SoniTranslate(SoniTrCache):
                 min_speakers,
                 max_speakers,
                 YOUR_HF_TOKEN[:len(YOUR_HF_TOKEN)//2],
-                diarization_model
+                diarization_model,
+                quality_signature("merge")
             ], {
                 "result": self.result
             }):
@@ -877,11 +891,16 @@ class SoniTranslate(SoniTrCache):
                     diarize_model_select,
                 )
                 logger.debug("Diarize complete")
+                if not subtitle_file:
+                    self.result_diarize = merge_short_segments(
+                        self.result_diarize, self.align_language
+                    )
             self.result_source_lang = copy.deepcopy(self.result_diarize)
 
             if not self.task_in_cache("translate", [
                 TRANSLATE_AUDIO_TO,
-                translate_process
+                translate_process,
+                quality_signature("glossary")
             ], {
                 "result_diarize": self.result_diarize
             }):
@@ -898,6 +917,13 @@ class SoniTranslate(SoniTrCache):
                     chunk_size=1800,
                     source=lang_source,
                 )
+                if translate_process != "disable_translation":
+                    # collapse translation loops + apply the names glossary
+                    self.result_diarize["segments"] = (
+                        clean_translated_segments(
+                            self.result_diarize["segments"]
+                        )
+                    )
                 logger.debug("Translation complete")
                 logger.debug(self.result_diarize)
 
@@ -2122,7 +2148,7 @@ def create_gui(theme, logs_in_gui=False):
                             batch_size = gr.Slider(
                                 minimum=1,
                                 maximum=32,
-                                value=8,
+                                value=16,
                                 label=lg_conf["batchz_label"],
                                 info=lg_conf["batchz_info"],
                                 step=1,

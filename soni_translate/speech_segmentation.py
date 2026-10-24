@@ -237,12 +237,27 @@ def transcribe_speech(
     )
 
     audio = whisperx.load_audio(audio_wav)
-    result = model.transcribe(
-        audio,
-        batch_size=batch_size,
-        chunk_size=segment_duration_limit,
-        print_progress=True,
-    )
+    result = None
+    current_batch = max(1, int(batch_size))
+    while result is None:
+        try:
+            result = model.transcribe(
+                audio,
+                batch_size=current_batch,
+                chunk_size=segment_duration_limit,
+                print_progress=True,
+            )
+        except RuntimeError as error:  # torch's OutOfMemoryError is one too
+            if "out of memory" in str(error).lower() and current_batch > 1:
+                current_batch = max(1, current_batch // 2)
+                logger.warning(
+                    "GPU out of memory: trying the transcription again "
+                    f"with batch_size={current_batch}"
+                )
+                gc.collect()
+                torch.cuda.empty_cache()  # noqa
+            else:
+                raise
 
     if result["language"] == "zh" and not prompt:
         result["language"] = "zh-TW"

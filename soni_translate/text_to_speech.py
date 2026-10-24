@@ -1455,6 +1455,7 @@ def segments_namaa_tts(filtered_namaa_segments, TRANSLATE_AUDIO_TO):
 #                                  reference language differs)
 #   SONITR_CHATTERBOX_EXAGGERATION default 0.5
 #   SONITR_CHATTERBOX_ALLOW_CPU=1  allow CPU if there is no GPU (very slow)
+#   SONITR_CHATTERBOX_GPUS         workers (GPUs) to use; default all, 1 = one
 # =====================================
 CHATTERBOX_WORKER = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "chatterbox_worker.py"
@@ -1608,12 +1609,122 @@ def prepare_chatterbox_reference(source, out_wav):
     return duration
 
 
+def _gpu_ids():
+    """GPU ids this process may use (honours CUDA_VISIBLE_DEVICES)."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None and visible.strip():
+        ids = [v.strip() for v in visible.split(",") if v.strip()]
+        if ids:
+            return ids
+    count = 0
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "-L"], capture_output=True, text=True, timeout=20
+        ).stdout
+        count = sum(1 for l in out.splitlines() if l.strip().startswith("GPU "))
+    except Exception:
+        pass
+    return [str(i) for i in range(max(1, count))]
+
+
+def chatterbox_worker_count(n_items, gpu_ids):
+    """One worker per GPU, but not for tiny jobs (every worker has to load
+    the model). SONITR_CHATTERBOX_GPUS limits it (1 = a single GPU)."""
+    count = len(gpu_ids)
+    forced = os.environ.get("SONITR_CHATTERBOX_GPUS")
+    if forced:
+        try:
+            count = max(1, min(int(forced), count))
+        except ValueError:
+            pass
+    return max(1, min(count, n_items // 4))
+
+
+def _shard_items(items, workers):
+    """Split the items so every worker gets about the same amount of text."""
+    shards = [[] for _ in range(workers)]
+    loads = [0] * workers
+    for item in sorted(items, key=lambda it: -len(it["text"])):
+        k = loads.index(min(loads))
+        shards[k].append(item)
+        loads[k] += len(item["text"]) + 40
+    return shards
+
+
+def _run_chatterbox_workers(python_path, shards, language, tmp_dir, gpu_ids,
+                            tag, live_procs):
+    """Start one chatterbox_worker per shard (each on its own GPU when
+    gpu_ids is given) and wait for all. Returns [{code, fatal, tail}, ...]."""
+    import json
+    import threading
+    from collections import deque
+
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
+    results = [{"code": None, "fatal": None, "tail": deque(maxlen=30)}
+               for _ in shards]
+    done = [0] * len(shards)
+    lock = threading.Lock()
+    progress_bar = tqdm(
+        total=sum(len(shard) for shard in shards),
+        desc="Chatterbox TTS" + (f" ({tag})" if tag != "w" else ""),
+    )
+
+    def reader(k, process):
+        for line in process.stdout:
+            line = line.strip()
+            if line.startswith("CBX_PROGRESS"):
+                try:
+                    done[k] = int(line.split()[1].split("/")[0])
+                    with lock:
+                        progress_bar.update(sum(done) - progress_bar.n)
+                except (IndexError, ValueError):
+                    pass
+            elif line.startswith("CBX_STATUS"):
+                logger.info(f"[{tag}{k}] {line}")
+            elif line.startswith("CBX_ITEM_ERROR"):
+                logger.warning(f"[{tag}{k}] {line}")
+            elif line.startswith("CBX_FATAL"):
+                results[k]["fatal"] = line[len("CBX_FATAL"):].strip()
+                logger.error(f"[{tag}{k}] {line}")
+            elif line:
+                results[k]["tail"].append(line[:300])
+        results[k]["code"] = process.wait()
+
+    threads = []
+    for k, shard in enumerate(shards):
+        jobs_path = os.path.join(tmp_dir, f"jobs_{tag}{k}.json")
+        with open(jobs_path, "w", encoding="utf-8") as f:
+            json.dump({"device": "cuda", "language": language,
+                       "items": shard}, f, ensure_ascii=False)
+        worker_env = dict(env)
+        if gpu_ids:
+            worker_env["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[k % len(gpu_ids)])
+        process = subprocess.Popen(
+            [python_path, CHATTERBOX_WORKER, jobs_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            encoding="utf-8", errors="replace", env=worker_env, bufsize=1,
+        )
+        live_procs.append(process)
+        thread = threading.Thread(target=reader, args=(k, process),
+                                  daemon=True)
+        thread.start()
+        threads.append(thread)
+    for thread in threads:
+        thread.join()
+    progress_bar.close()
+    return results
+
+
 def segments_chatterbox_tts(filtered_chatterbox_segments, TRANSLATE_AUDIO_TO):
     import gc
-    import json
     import shutil
     import tempfile
-    from collections import deque
 
     language = chatterbox_language(TRANSLATE_AUDIO_TO)
     segments = filtered_chatterbox_segments["segments"]
@@ -1667,65 +1778,43 @@ def segments_chatterbox_tts(filtered_chatterbox_segments, TRANSLATE_AUDIO_TO):
         })
     to_generate = [item for item in items if item["text"]]
 
-    process = None
+    live_procs = []
     try:
-        fatal_message = None
-        tail = deque(maxlen=30)
-        code = 0
+        results = []
         if to_generate:
-            jobs_path = os.path.join(tmp_dir, "jobs.json")
-            with open(jobs_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {"device": "cuda", "language": language,
-                     "items": to_generate},
-                    f, ensure_ascii=False,
-                )
-
-            env = os.environ.copy()
-            env.pop("PYTHONPATH", None)
-            env.pop("PYTHONHOME", None)
-            env["PYTHONUNBUFFERED"] = "1"
-            env["PYTHONIOENCODING"] = "utf-8"
-            env["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-
+            gpu_ids = _gpu_ids()
+            workers = chatterbox_worker_count(len(to_generate), gpu_ids)
+            shards = (_shard_items(to_generate, workers)
+                      if workers > 1 else [to_generate])
             logger.info(
                 f"Chatterbox TTS: {len(to_generate)} segments, language "
-                f"{language} (python: {python_path})"
+                f"{language}, {workers} GPU worker(s) "
+                f"(python: {python_path})"
             )
-            process = subprocess.Popen(
-                [python_path, CHATTERBOX_WORKER, jobs_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=env,
-                bufsize=1,
+            results = _run_chatterbox_workers(
+                python_path, shards, language, tmp_dir,
+                gpu_ids if workers > 1 else None, "w", live_procs,
             )
-            progress_bar = tqdm(
-                total=len(to_generate), desc="Chatterbox TTS"
+            missing = [it for it in to_generate
+                       if not os.path.exists(it["out"])]
+            worker_failed = any(
+                r["code"] != 0 or r["fatal"] for r in results
             )
-            for line in process.stdout:
-                line = line.strip()
-                if line.startswith("CBX_PROGRESS"):
-                    try:
-                        done = int(line.split()[1].split("/")[0])
-                        progress_bar.update(done - progress_bar.n)
-                    except (IndexError, ValueError):
-                        pass
-                elif line.startswith("CBX_STATUS"):
-                    logger.info(line)
-                elif line.startswith("CBX_ITEM_ERROR"):
-                    logger.warning(line)
-                elif line.startswith("CBX_FATAL"):
-                    fatal_message = line[len("CBX_FATAL"):].strip()
-                    logger.error(line)
-                elif line:
-                    tail.append(line[:300])
-            progress_bar.close()
-            code = process.wait()
+            if missing and worker_failed and len(missing) < len(to_generate):
+                logger.warning(
+                    f"{len(missing)} segments are missing because a worker "
+                    "failed; generating them again on one GPU."
+                )
+                results += _run_chatterbox_workers(
+                    python_path, [missing], language, tmp_dir,
+                    [gpu_ids[0]] if workers > 1 else None, "retry",
+                    live_procs,
+                )
 
-        produced = [os.path.exists(item["out"]) for item in items]
+        produced = [os.path.exists(item["out"]) for item in to_generate]
+        fatal_message = next((r["fatal"] for r in results if r["fatal"]), None)
+        code = next((r["code"] for r in results if r["code"]), 0)
+        tail = [line for r in results for line in r["tail"]][-30:]
         if to_generate and not any(produced):
             raise TTS_OperationError(
                 "Chatterbox TTS produced no audio"
@@ -1734,9 +1823,9 @@ def segments_chatterbox_tts(filtered_chatterbox_segments, TRANSLATE_AUDIO_TO):
                 + ("\nLast output of the Chatterbox process:\n"
                    + "\n".join(tail) if tail else "")
             )
-        if code != 0:
+        if code != 0 and not all(produced):
             logger.warning(
-                f"Chatterbox process ended with exit code {code}; segments "
+                f"A Chatterbox process ended with exit code {code}; segments "
                 "without audio will use the auxiliary TTS."
             )
 
@@ -1775,13 +1864,14 @@ def segments_chatterbox_tts(filtered_chatterbox_segments, TRANSLATE_AUDIO_TO):
                     error, segment, TRANSLATE_AUDIO_TO, filename
                 )
     finally:
-        if process is not None and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+        for process in live_procs:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
